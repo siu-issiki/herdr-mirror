@@ -29,25 +29,27 @@ workspaces/tabs/panes from your side.
 ## Installation
 
 ```bash
-herdr plugin install <owner>/herdr-mirror     # or: herdr plugin link <path>
+herdr plugin install nikok6/herdr-mirror     # or: herdr plugin link <path>
 ```
 
-Then create the config (see location with `herdr plugin config-dir mirror`;
-in dev it's `~/.config/herdr-mirror/hosts.toml`):
+Then create the config at `herdr plugin config-dir mirror`/`hosts.toml`
+(usually `~/.config/herdr/plugins/config/mirror/hosts.toml`):
 
 ```toml
 [hosts.work]
 target = "work"        # anything ssh accepts: alias, user@host, ssh://host:2222
 ```
 
-Start it — or just focus any workspace, which auto-starts the daemon:
+That's it — the daemon autostarts when you focus a workspace, so within a few
+seconds `work: *` workspaces appear in your sidebar. Check state any time with
+`herdr-mirror status`.
+
+If you've disabled autostart, start the daemon yourself by keybinding the
+"Mirror: start" action or running:
 
 ```bash
-./target/release/herdr-mirror start     # or the "Mirror: start" action
+./target/release/herdr-mirror start
 ```
-
-Within a few seconds `work: *` workspaces appear in your sidebar. Check state
-any time with `herdr-mirror status`.
 
 ## Usage
 
