@@ -174,8 +174,10 @@ target = "ssh://niko@203.0.113.7:2222"
 - **Layout geometry is copied, not linked**: pane content and typing are
   always live — only sizes are a snapshot. Remote pane adds/removes reconcile,
   but a split-ratio change at the remote doesn't resize an existing mirror.
-- **cwd-derived columns show local data** — git branch etc. reflect the machine
-  ssh runs from, not the remote repo.
+- **No git status on mirror rows** — herdr derives the sidebar git branch and
+  ahead/behind from the local workspace cwd, and there's no API to feed it a
+  remote repo's state, so mirror workspaces show no git chip. The remote's real
+  branch and status stay visible in the streamed pane's prompt.
 - **No custom sidebar UI** (plugin API limitation): mirrors are grouped only by
   the `<host>: ` naming convention.
 - **Remote must be reachable and running herdr**; the daemon surfaces a

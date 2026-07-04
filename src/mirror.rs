@@ -465,7 +465,11 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             walk_pane_ids(&exported.layout.root, &mut remote_order);
 
             if !tab_exists {
-                let cwd = deps.plugin_root.display().to_string();
+                // non-git dir on purpose: the pane exec's the streamer, so cwd
+                // is cosmetic, but herdr derives the sidebar git status from it —
+                // plugin_root (this repo) would leak herdr-mirror's own ahead/
+                // behind onto every mirror workspace
+                let cwd = deps.state_dir.display().to_string();
                 let root = map_node(&exported.layout.root, &cwd);
                 let target_tab = ws_entry.root_tab_local_id.clone();
                 // tab_id and workspace_id are mutually exclusive on layout.apply
@@ -515,7 +519,11 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 // PLAIN split panes (not agent.start), then exec the streamer in.
                 // agent.start would set launch_argv and surface every plain
                 // terminal as a phantom "mirror" agent row.
-                let cwd = deps.plugin_root.display().to_string();
+                // non-git dir on purpose: the pane exec's the streamer, so cwd
+                // is cosmetic, but herdr derives the sidebar git status from it —
+                // plugin_root (this repo) would leak herdr-mirror's own ahead/
+                // behind onto every mirror workspace
+                let cwd = deps.state_dir.display().to_string();
                 for rp in &remote_panes_in_tab {
                     if state.panes.contains_key(&rp.pane_id) {
                         continue;
