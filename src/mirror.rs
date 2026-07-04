@@ -196,6 +196,8 @@ pub struct ConvergeDeps {
     pub state_dir: PathBuf,
     pub plugin_root: PathBuf,
     pub log: Logger,
+    /// mirror closing a workspace/pane locally onto the remote (see MirrorConfig)
+    pub close_remote_on_local_close: bool,
 }
 
 /// argv for one mirror pane: this same binary in `pane` mode. Panes without a
@@ -284,28 +286,58 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
     }
     let cmd_for = cmd_for_pane(deps, &sizes);
 
-    // 1. detect mirrors the user closed locally → tombstone, never recreate
+    // 1. detect mirrors the user closed locally. Always TOMBSTONE (never
+    //    remove) so this same pass can't recreate the mirror — the remote
+    //    snapshot still lists the object until its close actually lands. With
+    //    close_remote_on_local_close, also close the matching remote object;
+    //    section 2 then reaps the tombstoned entry once the remote is gone.
+    //    Without the flag, the tombstone alone stops mirroring and leaves the
+    //    remote — and any agent on it — running.
+    let close_remote = deps.close_remote_on_local_close;
+    let mut ws_close_remote: Vec<String> = Vec::new();
     for (rid, entry) in state.workspaces.iter_mut() {
         if !entry.is_tombstoned() && !local_ws_ids.contains(&entry.local_id) && remote_ws_ids.contains(rid.as_str()) {
-            log.log(&format!("workspace mirror for {rid} was closed locally — tombstoning"));
             entry.tombstone = Some(true);
+            if close_remote {
+                ws_close_remote.push(rid.clone());
+            } else {
+                log.log(&format!("workspace mirror for {rid} was closed locally — tombstoning"));
+            }
+        }
+    }
+    for rid in &ws_close_remote {
+        log.log(&format!("workspace mirror for {rid} closed locally — closing remote workspace"));
+        if let Err(e) = deps.remote.request("workspace.close", json!({ "workspace_id": rid })).await {
+            log.log(&format!("remote workspace close failed for {rid}: {e}"));
         }
     }
     let pane_ws: HashMap<&str, &str> =
         remote_snap.panes.iter().map(|p| (p.pane_id.as_str(), p.workspace_id.as_str())).collect();
     let mut drop_panes: Vec<String> = Vec::new();
+    let mut pane_close_remote: Vec<String> = Vec::new();
     for (rid, entry) in state.panes.iter_mut() {
         if !entry.is_tombstoned() && !local_pane_ids.contains(entry.local_id.as_str()) && remote_pane_ids.contains(rid.as_str()) {
             let ws_entry = pane_ws.get(rid.as_str()).and_then(|ws| state.workspaces.get(*ws));
             // if the pane's whole mirror workspace is gone, the stale pane
-            // entry is collateral — drop it so recreation maps cleanly
+            // entry is collateral — drop it (its tombstoned workspace already
+            // blocks recreation)
             match ws_entry {
                 Some(w) if !w.is_tombstoned() && local_ws_ids.contains(&w.local_id) => {
-                    log.log(&format!("pane mirror for {rid} was closed locally — tombstoning"));
                     entry.tombstone = Some(true);
+                    if close_remote {
+                        pane_close_remote.push(rid.clone());
+                    } else {
+                        log.log(&format!("pane mirror for {rid} was closed locally — tombstoning"));
+                    }
                 }
                 _ => drop_panes.push(rid.clone()),
             }
+        }
+    }
+    for rid in &pane_close_remote {
+        log.log(&format!("pane mirror for {rid} closed locally — closing remote pane"));
+        if let Err(e) = deps.remote.request("pane.close", json!({ "pane_id": rid })).await {
+            log.log(&format!("remote pane close failed for {rid}: {e}"));
         }
     }
     for rid in drop_panes {

@@ -65,9 +65,11 @@ delivered). Both sides now share the session, tmux-style. Control auto-releases
 after 60s idle; `ctrl+\` releases immediately. The mouse wheel scrolls remote
 scrollback while driving.
 
-**Close / restore** — close a mirror like any pane (`prefix+x`); it won't come
-back on its own. Run the **restore** action (`herdr-mirror restore`) to bring
-back everything you've closed.
+**Close / restore** — by default, closing a mirror (`prefix+x`) also closes the
+pane/workspace on the remote (`close_remote_on_local_close`; set it false to
+only stop mirroring and leave the remote — and its agent — running). When the
+remote is left running, the **restore** action (`herdr-mirror restore`) brings
+back mirrors you closed.
 
 **Pause** — the **pause** action halts syncing; mirrors stay frozen in place
 and resume with **start**. `teardown` closes all mirrors and clears state.
@@ -145,6 +147,11 @@ are lifecycle/diagnostic and are usually run from the CLI rather than bound.
 # poll_seconds = 60      # reconcile poll interval (events drive most syncs)
 # default_host = "work"  # host that "new remote workspace" targets when
                          # invoked outside any mirror (default: first host)
+# close_remote_on_local_close = true
+                         # default. Closing a mirror pane/workspace locally
+                         # (e.g. prefix+x) also closes it on the remote. Set
+                         # false to only stop mirroring on a local close,
+                         # leaving the remote pane and its agent running.
 
 [hosts.work]
 target = "work"

@@ -23,6 +23,10 @@ pub struct MirrorConfig {
     /// host that remote-create actions target when invoked outside a mirror
     /// (falls back to the first host declared)
     pub default_host: Option<String>,
+    /// when true (the default), closing a mirror workspace/pane locally also
+    /// closes the matching object on the remote. Set false to make a local
+    /// close only stop mirroring, leaving the remote — and any agent — running.
+    pub close_remote_on_local_close: bool,
     pub hosts: Vec<HostConfig>,
 }
 
@@ -40,6 +44,7 @@ struct RawConfig {
     autostart: Option<bool>,
     poll_seconds: Option<u64>,
     default_host: Option<String>,
+    close_remote_on_local_close: Option<bool>,
     // toml::Table (preserve_order) keeps declaration order — the first host
     // is the remote-create fallback, so order is user-visible
     #[serde(default)]
@@ -92,6 +97,7 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
         poll_seconds: raw.poll_seconds.unwrap_or(60),
         autostart: raw.autostart.unwrap_or(true),
         default_host: raw.default_host,
+        close_remote_on_local_close: raw.close_remote_on_local_close.unwrap_or(true),
         hosts,
     })
 }

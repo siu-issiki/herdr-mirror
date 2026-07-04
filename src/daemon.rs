@@ -66,6 +66,7 @@ struct HostCtx {
     host: HostConfig,
     local: ApiClient,
     log: Logger,
+    close_remote_on_local_close: bool,
 }
 
 const BROADCAST_SUBS: &[&str] = &[
@@ -166,6 +167,7 @@ async fn run_connected(
         state_dir: ctx.env_state_dir.clone(),
         plugin_root: ctx.plugin_root.clone(),
         log: ctx.log.clone(),
+        close_remote_on_local_close: ctx.close_remote_on_local_close,
     };
     // broadcast-only first: subscribing a since-dead pane id is rejected, so
     // converge must prune the map before the per-pane upgrade
@@ -286,6 +288,7 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             host: h.clone(),
             local: local.clone(),
             log: log.clone(),
+            close_remote_on_local_close: config.close_remote_on_local_close,
         };
         tasks.push(tokio::spawn(host_task(ctx, rx)));
     }
@@ -449,6 +452,7 @@ pub async fn cmd_once(env: Env) -> Result<()> {
             state_dir: env.state_dir.clone(),
             plugin_root: env.plugin_root.clone(),
             log: log.clone(),
+            close_remote_on_local_close: config.close_remote_on_local_close,
         })
         .await?;
         log.log(&format!("[{}] one-shot mirror complete", h.name));
