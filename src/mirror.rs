@@ -140,11 +140,8 @@ fn walk_pane_ids(node: &LayoutNode, out: &mut Vec<String>) {
     }
 }
 
-/// Rebuild the layout tree as JSON of PLAIN shell panes (no `command`, so herdr
-/// does not set `launch_argv` / treat them as agent terminals). The streamer is
-/// started afterward with `exec` via `spawn_streamer_pane`. This keeps plain
-/// remote terminals out of the agents panel; only real remote agents (reported
-/// by `push_pane_status`) surface there.
+/// Layout tree as plain shell panes (no `command`, so herdr won't set
+/// `launch_argv` and treat them as agents); the streamer is exec'd in afterward.
 fn map_node(node: &LayoutNode, cwd: &str) -> Value {
     match node {
         LayoutNode::Pane { pane_id: _, label } => json!({
@@ -235,12 +232,10 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Run the streamer in an already-created PLAIN mirror pane by `exec`-ing it from
-/// the pane's shell. We deliberately do NOT launch it via `agent.start`/layout
-/// `command`: those set the terminal's `launch_argv`, which makes herdr treat the
-/// pane as an agent terminal forever — so plain remote terminals would show as
-/// phantom "mirror" agent rows. Running it as a shell `exec` leaves the terminal
-/// non-agent until `push_pane_status` reports a real remote agent onto it.
+/// Exec the streamer into an already-created plain pane. Not `agent.start` (or a
+/// layout `command`), which set `launch_argv` and would surface every mirror pane
+/// as an agent row; a shell `exec` keeps it non-agent until a real agent is
+/// reported onto it.
 async fn spawn_streamer_pane(local: &ApiClient, local_pane_id: &str, argv: &[String], log: &Logger) {
     let line = format!(
         "exec {}\n",
@@ -252,6 +247,27 @@ async fn spawn_streamer_pane(local: &ApiClient, local_pane_id: &str, argv: &[Str
     {
         log.log(&format!("spawn streamer {local_pane_id}: {e}"));
     }
+}
+
+/// cwd every mirror pane runs in, doubling as the loop-guard marker: it's set at
+/// pane creation so it's in the snapshot immediately (no exec race), and its name
+/// can't collide with a real dir.
+const MIRROR_CWD_MARKER: &str = ".mirror-pane";
+
+fn mirror_pane_cwd(state_dir: &std::path::Path) -> std::path::PathBuf {
+    state_dir.join(MIRROR_CWD_MARKER)
+}
+
+/// Is this remote pane another herdr-mirror's streamer pane? Read from the
+/// snapshot cwd marker — free, and race-free.
+fn pane_is_mirror(p: &PaneInfo) -> bool {
+    let is_marker = |c: &Option<String>| {
+        c.as_deref()
+            .and_then(|s| std::path::Path::new(s).file_name())
+            .and_then(|f| f.to_str())
+            == Some(MIRROR_CWD_MARKER)
+    };
+    is_marker(&p.foreground_cwd) || is_marker(&p.cwd)
 }
 
 // --- the converge pass ---
@@ -285,14 +301,12 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         }
     }
     let cmd_for = cmd_for_pane(deps, &sizes);
+    let _ = std::fs::create_dir_all(mirror_pane_cwd(&deps.state_dir));
 
-    // 1. detect mirrors the user closed locally. Always TOMBSTONE (never
-    //    remove) so this same pass can't recreate the mirror — the remote
-    //    snapshot still lists the object until its close actually lands. With
-    //    close_remote_on_local_close, also close the matching remote object;
-    //    section 2 then reaps the tombstoned entry once the remote is gone.
-    //    Without the flag, the tombstone alone stops mirroring and leaves the
-    //    remote — and any agent on it — running.
+    // 1. detect mirrors the user closed locally. Always tombstone (never remove)
+    //    so this pass can't recreate them (the snapshot still lists the object).
+    //    With close_remote_on_local_close, also close the remote object; section
+    //    2 reaps the tombstoned entry once the remote is gone.
     let close_remote = deps.close_remote_on_local_close;
     let mut ws_close_remote: Vec<String> = Vec::new();
     for (rid, entry) in state.workspaces.iter_mut() {
@@ -373,8 +387,27 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         }
     }
 
+    // skip remote workspaces that are entirely another herdr-mirror's streamer
+    // panes (a machine mirroring us back), so mutual mirroring can't nest.
+    let mut panes_by_ws: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
+    for p in &remote_snap.panes {
+        panes_by_ws.entry(p.workspace_id.as_str()).or_default().push(p);
+    }
+    let mut mirror_ws_ids: HashSet<String> = HashSet::new();
+    for rws in &remote_snap.workspaces {
+        let Some(panes) = panes_by_ws.get(rws.workspace_id.as_str()).filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        if panes.iter().all(|p| pane_is_mirror(p)) {
+            mirror_ws_ids.insert(rws.workspace_id.clone());
+        }
+    }
+
     // 3. remote workspaces → ensure mirrors exist with the right label
     for rws in &remote_snap.workspaces {
+        if mirror_ws_ids.contains(&rws.workspace_id) {
+            continue;
+        }
         let label = format!("{}: {}", host.prefix, rws.label);
         if state.workspaces.get(&rws.workspace_id).is_some_and(|e| e.is_tombstoned()) {
             continue;
@@ -465,11 +498,9 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             walk_pane_ids(&exported.layout.root, &mut remote_order);
 
             if !tab_exists {
-                // non-git dir on purpose: the pane exec's the streamer, so cwd
-                // is cosmetic, but herdr derives the sidebar git status from it —
-                // plugin_root (this repo) would leak herdr-mirror's own ahead/
-                // behind onto every mirror workspace
-                let cwd = deps.state_dir.display().to_string();
+                // non-git cwd so herdr shows no (misleading) sidebar git status
+                // for the mirror; the pane exec's the streamer regardless
+                let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
                 let root = map_node(&exported.layout.root, &cwd);
                 let target_tab = ws_entry.root_tab_local_id.clone();
                 // tab_id and workspace_id are mutually exclusive on layout.apply
@@ -519,11 +550,9 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 // PLAIN split panes (not agent.start), then exec the streamer in.
                 // agent.start would set launch_argv and surface every plain
                 // terminal as a phantom "mirror" agent row.
-                // non-git dir on purpose: the pane exec's the streamer, so cwd
-                // is cosmetic, but herdr derives the sidebar git status from it —
-                // plugin_root (this repo) would leak herdr-mirror's own ahead/
-                // behind onto every mirror workspace
-                let cwd = deps.state_dir.display().to_string();
+                // non-git cwd so herdr shows no (misleading) sidebar git status
+                // for the mirror; the pane exec's the streamer regardless
+                let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
                 for rp in &remote_panes_in_tab {
                     if state.panes.contains_key(&rp.pane_id) {
                         continue;
