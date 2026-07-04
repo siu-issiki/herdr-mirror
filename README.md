@@ -5,6 +5,10 @@ workspaces and agents into your local sidebar. One window shows the agents on
 every machine — blocked, working, done — with live pane content you can watch
 and drive over ssh.
 
+<p align="center">
+  <img src="assets/hero.png" width="720" alt="herdr-mirror: local and remote herdr sessions unified in one window">
+</p>
+
 Each remote workspace becomes a real local workspace named `<host>: <name>`.
 Its panes stream the remote terminal live; its agents report their real state.
 Mirroring is one-way (the remote needs no plugin — just herdr), but you can
@@ -89,13 +93,45 @@ Actions have no default keys; bind them in `~/.config/herdr/config.toml`, then
 [[keys.command]]
 key = "prefix+shift+m"
 type = "plugin_action"
-command = "mirror.start"
+command = "mirror.start"       # start / resume the daemon
 
 [[keys.command]]
-key = "prefix+shift+s"
+key = "prefix+shift+p"
 type = "plugin_action"
-command = "mirror.pause"
+command = "mirror.pause"       # freeze syncing; start again to resume
+
+[[keys.command]]
+key = "prefix+shift+r"
+type = "plugin_action"
+command = "mirror.restore"     # bring back mirrors you closed locally
+
+# remote-* actions run from inside a mirror pane and create objects on that
+# pane's remote host — the cross-ssh twins of herdr's native new/split keys.
+# Binding them to the native keys plus one extra modifier keeps the muscle memory.
+[[keys.command]]
+key = "prefix+alt+n"
+type = "plugin_action"
+command = "mirror.remote-new-workspace"
+
+[[keys.command]]
+key = "prefix+alt+t"
+type = "plugin_action"
+command = "mirror.remote-new-tab"
+
+[[keys.command]]
+key = "prefix+alt+\\"
+type = "plugin_action"
+command = "mirror.remote-split-right"
+
+[[keys.command]]
+key = "prefix+alt+-"
+type = "plugin_action"
+command = "mirror.remote-split-down"
 ```
+
+The remaining actions — `mirror.status`, `mirror.once`, `mirror.teardown`,
+`mirror.ensure` — are lifecycle/diagnostic and are usually run from the CLI
+rather than bound to keys.
 
 ## Configuration
 
