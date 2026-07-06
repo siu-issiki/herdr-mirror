@@ -208,6 +208,7 @@ fn cmd_for_pane(deps: &ConvergeDeps, sizes: &HashMap<String, LayoutRect>) -> imp
         .unwrap_or_else(|_| "herdr-mirror".into());
     let target = deps.host.target.clone();
     let remote_bin = deps.host.remote_bin.clone();
+    let always_control = deps.host.always_control;
     let sizes = sizes.clone();
     move |pane_id: &str| {
         let mut argv = vec![
@@ -218,6 +219,9 @@ fn cmd_for_pane(deps: &ConvergeDeps, sizes: &HashMap<String, LayoutRect>) -> imp
             "--remote-bin".into(),
             remote_bin.clone(),
         ];
+        if always_control {
+            argv.push("--always-control".into());
+        }
         if let Some(rect) = sizes.get(pane_id) {
             argv.extend([
                 "--cols".into(),

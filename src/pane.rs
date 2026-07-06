@@ -12,7 +12,9 @@
 //                       remote PTY size or the server clips bottom rows away)
 //   --dump              headless mode: print plain-text screen per frame
 //   --session NAME      remote named session (passed as --session to herdr)
-//   --control-idle N    auto-release control after N seconds idle (default 60)
+//   --control-idle N    auto-release control after N seconds idle (default 3600)
+//   --always-control    start and stay in control: writable, no idle release,
+//                       and sized to the local pane so it fills
 //
 // Every stream gets its own direct ssh connection (no shared ControlMaster):
 // isolated, and nothing persists to go stale on a flaky network.
@@ -54,6 +56,9 @@ pub struct Args {
     pub control_idle_secs: u64,
     /// --cols/--rows are the remote pane's real size (plus margin), use as-is
     pub size_fixed: bool,
+    /// start and stay in control: writable, no idle release, and sized to the
+    /// local pane so it fills. Set by the daemon from per-host config.
+    pub always_control: bool,
 }
 
 pub fn parse_args(argv: &[String]) -> Result<Args> {
@@ -65,8 +70,9 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         rows: 72,
         dump: false,
         session: None,
-        control_idle_secs: 60,
+        control_idle_secs: 3600,
         size_fixed: false,
+        always_control: false,
     };
     let mut positional: Vec<String> = Vec::new();
     let mut it = argv.iter();
@@ -89,6 +95,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
                 args.control_idle_secs =
                     next("--control-idle")?.parse().map_err(|_| err("--control-idle must be a number"))?
             }
+            "--always-control" => args.always_control = true,
             "--dump" => args.dump = true,
             other if other.starts_with('-') => return Err(err(format!("unknown option: {other}"))),
             other => positional.push(other.to_string()),
@@ -648,7 +655,7 @@ pub async fn run(args: Args) -> Result<()> {
         last_input: Instant::now(),
         hint_clear_at: None,
     };
-    app.connect(Mode::Observe).await;
+    app.connect(if app.args.always_control { Mode::Control } else { Mode::Observe }).await;
 
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
@@ -660,6 +667,7 @@ pub async fn run(args: Args) -> Result<()> {
         let idle_at = (app.mode == Mode::Control
             && app.switching_to.is_none()
             && app.session.is_some()
+            && !app.args.always_control
             && app.args.control_idle_secs > 0)
             .then(|| app.last_input + Duration::from_secs(app.args.control_idle_secs));
         let sleep = crate::util::sleep_until_earliest([

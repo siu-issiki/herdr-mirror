@@ -57,13 +57,16 @@ If you've disabled autostart, start the daemon yourself by keybinding the
 
 ## Usage
 
-**Watch** — mirror panes are read-only by default: a live view of the remote
-pane with zero effect on the remote.
+**Drive** — the default (`always_control = true`) is tuned for headless remotes
+(a vps, a server) with no window of their own: it keeps each mirror pane
+writable and sized to your local pane, so the headless remote fills it instead
+of showing a tiny default-sized window. Type and your keystrokes go to the
+remote, tmux-style; the mouse wheel scrolls remote scrollback.
 
-**Drive** — type into a mirror pane to take control (your keystroke is
-delivered). Both sides now share the session, tmux-style. Control auto-releases
-after 60s idle; `ctrl+\` releases immediately. The mouse wheel scrolls remote
-scrollback while driving.
+**Watch-only** — for a machine with its own display or a human sitting at it,
+set `always_control = false` (globally or per host). Its mirrors become
+read-only: a live view with zero effect on the remote that escalates to control
+when you type and auto-releases after 1h idle (`ctrl+\` releases immediately).
 
 **Close / restore** — by default, closing a mirror (`prefix+x`) also closes the
 pane/workspace on the remote (`close_remote_on_local_close`; set it false to
@@ -152,11 +155,17 @@ are lifecycle/diagnostic and are usually run from the CLI rather than bound.
                          # (e.g. prefix+x) also closes it on the remote. Set
                          # false to only stop mirroring on a local close,
                          # leaving the remote pane and its agent running.
+# always_control = true  # default. Mirror panes stay in control: writable, no
+                         # idle release, and sized to your local pane so the
+                         # remote fills it (ideal for headless remotes). Set
+                         # false for read-only mirrors that escalate on type.
 
 [hosts.work]
 target = "work"
 # prefix = "work"                    # sidebar prefix (default: the host key)
 # remote_bin = "~/.local/bin/herdr"  # remote path if it's not on ssh's PATH
+# always_control = false             # per-host override, e.g. a host you use
+                                     # directly (don't drive its pane sizes)
 # enabled = true                     # false stops syncing this host without
                                      # deleting its config; mirrors stay put
 
@@ -178,8 +187,9 @@ target = "ssh://niko@203.0.113.7:2222"
   ahead/behind from the local workspace cwd, and there's no API to feed it a
   remote repo's state, so mirror workspaces show no git chip. The remote's real
   branch and status stay visible in the streamed pane's prompt.
-- **No custom sidebar UI** (plugin API limitation): mirrors are grouped only by
-  the `<host>: ` naming convention.
+- **No custom sidebar UI** (plugin API limitation): mirrors carry a `<host>: `
+  label prefix and the daemon keeps them ordered into per-host groups, but it
+  can't render a richer affordance (group headers, collapse, colour).
 - **Remote must be reachable and running herdr**; the daemon surfaces a
   readable status if a host is down or on too old a version.
 

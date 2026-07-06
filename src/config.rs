@@ -13,6 +13,10 @@ pub struct HostConfig {
     pub target: String,
     pub prefix: String,
     pub remote_bin: String,
+    /// keep each mirror pane in control (writable, no idle release, and sized to
+    /// the local pane so it fills). Default on; ideal for headless remotes. Turn
+    /// off per host for a remote a human is actively using directly.
+    pub always_control: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +49,7 @@ struct RawConfig {
     poll_seconds: Option<u64>,
     default_host: Option<String>,
     close_remote_on_local_close: Option<bool>,
+    always_control: Option<bool>,
     // toml::Table (preserve_order) keeps declaration order — the first host
     // is the remote-create fallback, so order is user-visible
     #[serde(default)]
@@ -57,6 +62,7 @@ struct RawHost {
     prefix: Option<String>,
     remote_bin: Option<String>,
     enabled: Option<bool>,
+    always_control: Option<bool>,
 }
 
 pub fn load_config(config_dir: &Path) -> Result<MirrorConfig> {
@@ -72,6 +78,7 @@ pub fn load_config(config_dir: &Path) -> Result<MirrorConfig> {
 
 pub fn parse_config(text: &str) -> Result<MirrorConfig> {
     let raw: RawConfig = toml::from_str(text)?;
+    let global_always_control = raw.always_control.unwrap_or(true);
     let mut hosts: Vec<HostConfig> = Vec::new();
     for (name, value) in raw.hosts {
         let h: RawHost = value.try_into().map_err(|e| err(format!("[hosts.{name}]: {e}")))?;
@@ -81,6 +88,7 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
         hosts.push(HostConfig {
             prefix: h.prefix.unwrap_or_else(|| name.clone()),
             remote_bin: h.remote_bin.unwrap_or_else(|| "~/.local/bin/herdr".into()),
+            always_control: h.always_control.unwrap_or(global_always_control),
             target: h.target,
             name,
         });
@@ -116,6 +124,22 @@ mod tests {
         assert_eq!(h.name, "work");
         assert_eq!(h.prefix, "work");
         assert_eq!(h.remote_bin, "~/.local/bin/herdr");
+        assert!(h.always_control); // default on
+    }
+
+    #[test]
+    fn always_control_global_default_and_per_host_override() {
+        // global off, one host overrides back on
+        let c = parse_config(
+            "always_control = false\n\
+             [hosts.a]\ntarget = \"a\"\n\
+             [hosts.b]\ntarget = \"b\"\nalways_control = true\n",
+        )
+        .unwrap();
+        let a = c.hosts.iter().find(|h| h.name == "a").unwrap();
+        let b = c.hosts.iter().find(|h| h.name == "b").unwrap();
+        assert!(!a.always_control); // inherits global off
+        assert!(b.always_control); // per-host override on
     }
 
     #[test]
