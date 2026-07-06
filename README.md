@@ -34,6 +34,7 @@ workspaces/tabs/panes from your side.
 
 ```bash
 herdr plugin install nikok6/herdr-mirror     # or: herdr plugin link <path>
+herdr server reload-config                   # load the plugin (actions + autostart hook)
 ```
 
 Then create the config at `herdr plugin config-dir mirror`/`hosts.toml`
@@ -109,6 +110,11 @@ command = "mirror.pause"       # freeze syncing; start again to resume
 key = "prefix+shift+b"         # "bring back" (shift+r is native reload_config)
 type = "plugin_action"
 command = "mirror.restore"     # un-close mirrors you closed locally
+
+[[keys.command]]
+key = "prefix+alt+d"           # destructive: closes ALL mirrors + clears state
+type = "plugin_action"
+command = "mirror.teardown"    # stop mirroring everything (start to resume)
 
 # Create objects on the REMOTE host — run these from inside a mirror pane, which
 # supplies the target host and cwd. Each is herdr's native local key + alt

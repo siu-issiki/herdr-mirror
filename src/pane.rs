@@ -423,7 +423,14 @@ impl App {
                     self.pending_input.clear();
                 }
                 self.session = Some(s);
-                self.renderer.status(if m == Mode::Control { "CONTROL — ctrl+\\ to release" } else { "" });
+                // always-control has no release, so no "ctrl+\ to release" hint
+                self.renderer.status(
+                    if m == Mode::Control && !self.args.always_control {
+                        "CONTROL — ctrl+\\ to release"
+                    } else {
+                        ""
+                    },
+                );
             }
             Err(e) => self.schedule_reconnect(m, &e.to_string()),
         }
@@ -551,9 +558,12 @@ impl App {
         // control mode
         self.last_input = Instant::now();
         if buf.len() == 1 && buf[0] == 0x1c {
-            // ctrl+\ — manual release is deliberate: no wheel auto-retake
-            self.control_sticky = false;
-            self.switch_mode(Mode::Observe);
+            // ctrl+\ — manual release. In always-control there's nothing to
+            // release to, so swallow it (never forward it: ctrl+\ is SIGQUIT).
+            if !self.args.always_control {
+                self.control_sticky = false;
+                self.switch_mode(Mode::Observe);
+            }
             return;
         }
         if self.switching_to == Some(Mode::Control) || self.session.is_none() {
