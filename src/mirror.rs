@@ -189,6 +189,44 @@ fn clamp_status(s: &str) -> String {
 const OBSERVE_MARGIN_COLS: u32 = 16;
 const OBSERVE_MARGIN_ROWS: u32 = 8;
 
+/// How to resolve a mirror-workspace label state.
+#[derive(Debug, PartialEq)]
+enum LabelAction {
+    /// labels agree — nothing to do
+    InSync,
+    /// user renamed the mirror locally → rename the REMOTE workspace to this
+    PushRemote(String),
+    /// remote is the authority (remote renamed, or unknown history) → restamp local
+    RestampLocal,
+}
+
+/// Two-way rename resolution. `last_remote` is the remote label as of the
+/// previous converge (None = pre-upgrade state file / first sight: remote wins).
+fn resolve_ws_label(
+    prefix: &str,
+    remote_label: &str,
+    local_label: &str,
+    last_remote: Option<&str>,
+) -> LabelAction {
+    let expected = format!("{prefix}: {remote_label}");
+    if local_label == expected {
+        return LabelAction::InSync;
+    }
+    if last_remote != Some(remote_label) {
+        // remote changed since we last stamped (or no history) — remote wins
+        return LabelAction::RestampLocal;
+    }
+    // remote unchanged, local differs → this is a user rename. Accept it with
+    // or without the "<prefix>: " convention; empty/degenerate names restamp.
+    let stripped =
+        local_label.strip_prefix(&format!("{prefix}: ")).unwrap_or(local_label).trim();
+    if stripped.is_empty() || stripped == remote_label {
+        LabelAction::RestampLocal
+    } else {
+        LabelAction::PushRemote(stripped.to_string())
+    }
+}
+
 pub struct ConvergeDeps {
     pub local: ApiClient,
     pub remote: ApiClient,
@@ -442,10 +480,48 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             .cloned();
         if let Some(entry) = existing {
             let local_ws = local_snap.workspaces.iter().find(|w| w.workspace_id == entry.local_id);
-            if local_ws.is_some_and(|w| w.label != label) {
-                deps.local
-                    .request("workspace.rename", json!({ "workspace_id": entry.local_id, "label": label }))
-                    .await?;
+            if let Some(lws) = local_ws {
+                match resolve_ws_label(&host.prefix, &rws.label, &lws.label, entry.last_remote_label.as_deref()) {
+                    LabelAction::PushRemote(new_remote) => {
+                        // the user renamed the mirror → the rename is intent for
+                        // the REMOTE workspace; push it there and restamp local
+                        // with the canonical "<prefix>: <name>" form
+                        log.log(&format!(
+                            "local rename of {} → pushing \"{new_remote}\" to remote {}",
+                            lws.label, rws.workspace_id
+                        ));
+                        deps.remote
+                            .request(
+                                "workspace.rename",
+                                json!({ "workspace_id": rws.workspace_id, "label": new_remote }),
+                            )
+                            .await?;
+                        let stamped = format!("{}: {}", host.prefix, new_remote);
+                        if lws.label != stamped {
+                            deps.local
+                                .request("workspace.rename", json!({ "workspace_id": entry.local_id, "label": stamped }))
+                                .await?;
+                        }
+                        if let Some(e) = state.workspaces.get_mut(&rws.workspace_id) {
+                            e.last_remote_label = Some(new_remote);
+                        }
+                    }
+                    LabelAction::RestampLocal => {
+                        deps.local
+                            .request("workspace.rename", json!({ "workspace_id": entry.local_id, "label": label }))
+                            .await?;
+                        if let Some(e) = state.workspaces.get_mut(&rws.workspace_id) {
+                            e.last_remote_label = Some(rws.label.clone());
+                        }
+                    }
+                    LabelAction::InSync => {
+                        if entry.last_remote_label.as_deref() != Some(rws.label.as_str()) {
+                            if let Some(e) = state.workspaces.get_mut(&rws.workspace_id) {
+                                e.last_remote_label = Some(rws.label.clone());
+                            }
+                        }
+                    }
+                }
             }
         } else {
             // adopt a label-matching unmapped local workspace (orphan from a crash)
@@ -464,6 +540,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     } else {
                         None
                     },
+                    last_remote_label: Some(rws.label.clone()),
                 }
             } else {
                 log.log(&format!("creating mirror workspace {label}"));
@@ -488,6 +565,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                     local_id: created.workspace.workspace_id,
                     tombstone: None,
                     root_tab_local_id: Some(created.tab.tab_id),
+                    last_remote_label: Some(rws.label.clone()),
                 }
             };
             local_ws_ids.insert(entry.local_id.clone());
@@ -895,6 +973,28 @@ pub async fn regroup_sidebar(local: &ApiClient, prefixes: &[String], log: &Logge
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ws_label_two_way_rename() {
+        // in sync → nothing
+        assert_eq!(resolve_ws_label("pm", "scratch", "pm: scratch", Some("scratch")), LabelAction::InSync);
+        // remote renamed (history differs) → remote wins
+        assert_eq!(resolve_ws_label("pm", "runs", "pm: scratch", Some("scratch")), LabelAction::RestampLocal);
+        // no history (pre-upgrade state file) → remote wins once
+        assert_eq!(resolve_ws_label("pm", "scratch", "pm: LLMs", None), LabelAction::RestampLocal);
+        // user renamed locally, kept the prefix → push stripped name to remote
+        assert_eq!(
+            resolve_ws_label("pm", "scratch", "pm: LLMs", Some("scratch")),
+            LabelAction::PushRemote("LLMs".into())
+        );
+        // user renamed locally without prefix → push as-is
+        assert_eq!(
+            resolve_ws_label("pm", "scratch", "LLM runs", Some("scratch")),
+            LabelAction::PushRemote("LLM runs".into())
+        );
+        // degenerate: renamed to just the prefix-colon or whitespace → restamp
+        assert_eq!(resolve_ws_label("pm", "scratch", "pm:  ", Some("scratch")), LabelAction::RestampLocal);
+    }
 
     /// The `pane_agent_status_changed` event (herdr app/api.rs) must deserialize
     /// into AgentInfo cleanly, or flush_status would fall back to a default (no

@@ -43,6 +43,11 @@ pub struct WsEntry {
     /// first remote tab's layout.apply so it doesn't stack an extra tab
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root_tab_local_id: Option<String>,
+    /// remote label as of the last converge — distinguishes "remote renamed"
+    /// (remote wins, restamp local) from "user renamed the mirror locally"
+    /// (push the rename to the remote instead of stomping it)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_remote_label: Option<String>,
 }
 
 impl WsEntry {
