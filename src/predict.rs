@@ -184,10 +184,9 @@ impl Predictor {
             if wr >= out_rows || p.col >= out_cols {
                 continue;
             }
-            // underlined = optimistic, not yet frame-confirmed (mosh-style).
-            // Kept as a permanent visual cue (operator preference): the
-            // underline vanishing ~100ms later is the confirmation heartbeat.
-            let _ = write!(out, "\x1b[{};{}H\x1b[0;4m{}\x1b[0m", wr + 1, p.col + 1, p.ch);
+            // draw the optimistic echo plain (no underline): prediction is meant
+            // to be invisible when right; the confirming frame overwrites it.
+            let _ = write!(out, "\x1b[{};{}H\x1b[0m{}\x1b[0m", wr + 1, p.col + 1, p.ch);
             last = Some((wr, p.col));
         }
         if let Some((wr, col)) = last {
