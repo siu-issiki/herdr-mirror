@@ -12,6 +12,7 @@ mod daemon;
 mod grid;
 mod mirror;
 mod pane;
+mod predict;
 mod remote;
 mod remote_action;
 mod state;
