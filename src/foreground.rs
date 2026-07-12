@@ -44,11 +44,23 @@ pub fn classify(json: &str) -> Option<bool> {
 
 /// Query the remote pane's foreground process over ssh and classify it. `None`
 /// on any failure (ssh/network/parse) so the caller keeps its last known value.
-pub async fn poll(ssh_target: &str, remote_bin: &str, pane: &str) -> Option<bool> {
+pub async fn poll(
+    ssh_target: &str,
+    remote_bin: &str,
+    pane: &str,
+    ctl_path: Option<&str>,
+) -> Option<bool> {
     // remote_bin stays unquoted for remote-shell ~ expansion, matching the
     // observe session's command construction
     let cmd = format!("exec {} pane process-info --pane {}", remote_bin, sh_quote(pane));
-    let out = Command::new("ssh")
+    let mut sc = Command::new("ssh");
+    // reuse the daemon's ControlMaster when given so the poll skips the
+    // handshake; `-S` without `-M` uses an existing master or, if the socket
+    // isn't there, connects directly — so this degrades gracefully
+    if let Some(path) = ctl_path {
+        sc.arg("-S").arg(path);
+    }
+    let out = sc
         .args(SSH_COMMON_OPTS)
         .arg(ssh_target)
         .arg(cmd)

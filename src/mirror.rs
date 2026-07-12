@@ -284,6 +284,9 @@ fn cmd_for_pane(deps: &ConvergeDeps, sizes: &HashMap<String, LayoutRect>) -> imp
     let target = deps.host.target.clone();
     let remote_bin = deps.host.remote_bin.clone();
     let always_control = deps.host.always_control;
+    // daemon's ControlMaster socket for this host (see remote.rs); the streamer
+    // reuses it for cheap foreground polls
+    let ctl_path = deps.state_dir.join(format!("{}.ctl", deps.host.name)).display().to_string();
     let sizes = sizes.clone();
     move |pane_id: &str| {
         let mut argv = vec![
@@ -297,6 +300,7 @@ fn cmd_for_pane(deps: &ConvergeDeps, sizes: &HashMap<String, LayoutRect>) -> imp
         if always_control {
             argv.push("--always-control".into());
         }
+        argv.extend(["--ctl-path".into(), ctl_path.clone()]);
         if let Some(rect) = sizes.get(pane_id) {
             argv.extend([
                 "--cols".into(),

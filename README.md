@@ -145,6 +145,19 @@ which falls back to `default_host` when run outside one). The remaining
 actions — `mirror.status`, `mirror.once`, `mirror.teardown`, `mirror.ensure` —
 are lifecycle/diagnostic and are usually run from the CLI rather than bound.
 
+### Mouse
+
+Mirror panes adapt to what's running on the remote pane:
+
+- at a **shell**, the mouse stays local — drag-select and copy work natively, and
+  nothing leaks into the prompt;
+- in a **TUI** (vim, htop, lazygit, …), clicks and wheel forward to the app.
+
+herdr's streamed frames don't carry the app's mouse mode, so the plugin infers it
+from the remote pane's foreground process — anything that isn't a known shell is
+treated as a mouse-aware TUI. Detection is polled, so after switching between a
+shell and a TUI there's a brief lag before the mouse mode catches up.
+
 ## Configuration
 
 `hosts.toml`:

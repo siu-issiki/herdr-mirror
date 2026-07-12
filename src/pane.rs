@@ -60,6 +60,9 @@ pub struct Args {
     /// start and stay in control: writable, no idle release, and sized to the
     /// local pane so it fills. Set by the daemon from per-host config.
     pub always_control: bool,
+    /// daemon's ssh ControlMaster socket for this host; foreground polls reuse it
+    /// (`ssh -S <path>`) to skip a handshake. None → polls connect directly.
+    pub ctl_path: Option<String>,
 }
 
 pub fn parse_args(argv: &[String]) -> Result<Args> {
@@ -74,6 +77,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         control_idle_secs: 3600,
         size_fixed: false,
         always_control: false,
+        ctl_path: None,
     };
     let mut positional: Vec<String> = Vec::new();
     let mut it = argv.iter();
@@ -97,6 +101,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
                     next("--control-idle")?.parse().map_err(|_| err("--control-idle must be a number"))?
             }
             "--always-control" => args.always_control = true,
+            "--ctl-path" => args.ctl_path = Some(next("--ctl-path")?),
             "--dump" => args.dump = true,
             other if other.starts_with('-') => return Err(err(format!("unknown option: {other}"))),
             other => positional.push(other.to_string()),
@@ -371,6 +376,9 @@ struct App {
     remote_is_shell: Option<bool>,
     /// last time a foreground poll was kicked off (throttles the ssh handshakes)
     fg_poll_at: Option<Instant>,
+    /// scheduled delayed re-poll to catch a foreground change the last input just
+    /// caused (e.g. quitting a TUI back to a shell); bypasses the throttle
+    settle_at: Option<Instant>,
     /// whether the local mouse grab (?1002h) is currently on. Released at a shell
     /// so herdr does native selection/scroll; re-grabbed for a TUI so clicks can
     /// be forwarded.
@@ -380,6 +388,10 @@ struct App {
 /// minimum spacing between foreground polls — each is an ssh handshake, so we
 /// poll lazily (only around mouse activity) and no faster than this
 const FG_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// after input settles, re-poll once this much later to catch a foreground
+/// change the input caused (e.g. a TUI just exited); bypasses FG_POLL_INTERVAL
+const SETTLE_DELAY: Duration = Duration::from_millis(350);
 
 impl App {
     fn paint(&mut self) {
@@ -414,9 +426,9 @@ impl App {
     /// Kick a background poll of the remote pane's foreground process, throttled
     /// so a mouse burst doesn't spawn an ssh per event. The result arrives as
     /// Msg::Foreground and updates `remote_is_shell`.
-    fn spawn_foreground_poll(&mut self) {
+    fn spawn_foreground_poll(&mut self, force: bool) {
         let now = Instant::now();
-        if self.fg_poll_at.is_some_and(|t| now.duration_since(t) < FG_POLL_INTERVAL) {
+        if !force && self.fg_poll_at.is_some_and(|t| now.duration_since(t) < FG_POLL_INTERVAL) {
             return;
         }
         self.fg_poll_at = Some(now);
@@ -424,8 +436,9 @@ impl App {
         let ssh = self.args.ssh_target.clone();
         let bin = self.args.remote_bin.clone();
         let pane = self.args.pane_target.clone();
+        let ctl = self.args.ctl_path.clone();
         tokio::spawn(async move {
-            let v = crate::foreground::poll(&ssh, &bin, &pane).await;
+            let v = crate::foreground::poll(&ssh, &bin, &pane, ctl.as_deref()).await;
             let _ = tx.send(Msg::Foreground(v)).await;
         });
     }
@@ -496,7 +509,7 @@ impl App {
                 }
                 self.session = Some(s);
                 // warm the foreground classification before the user mouses
-                self.spawn_foreground_poll();
+                self.spawn_foreground_poll(false);
                 // always-control has no release, so no "ctrl+\ to release" hint
                 self.renderer.status(
                     if m == Mode::Control && !self.args.always_control {
@@ -655,7 +668,10 @@ impl App {
         // keyboard reaches us even when the grab is released at a shell, so this
         // is what catches a shell→TUI switch — a released grab means mouse events
         // stop arriving here, so mouse alone can never trigger the re-poll.
-        self.spawn_foreground_poll();
+        self.spawn_foreground_poll(false);
+        // and re-check shortly after input settles, to catch a change the input
+        // just caused (e.g. `:q` quitting vim — the poll above still sees vim)
+        self.settle_at = Some(Instant::now() + SETTLE_DELAY);
         // wheel becomes a semantic scroll (server decides app vs scrollback);
         // clicks/drags forward to the remote pty only when the foreground is a
         // TUI — at a shell they're dropped so they don't garbage the prompt
@@ -756,6 +772,7 @@ pub async fn run(args: Args) -> Result<()> {
         predict: Predictor::new(),
         remote_is_shell: None,
         fg_poll_at: None,
+        settle_at: None,
         mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
     };
     app.connect(if app.args.always_control { Mode::Control } else { Mode::Observe }).await;
@@ -779,6 +796,7 @@ pub async fn run(args: Args) -> Result<()> {
             app.hint_clear_at,
             idle_at,
             app.predict.deadline(),
+            app.settle_at,
         ]);
 
         tokio::select! {
@@ -829,6 +847,10 @@ pub async fn run(args: Args) -> Result<()> {
                     app.control_sticky = true;
                     app.switch_mode(Mode::Observe);
                     app.hint("control released (idle) — type to retake");
+                }
+                if app.settle_at.is_some_and(|t| t <= now) {
+                    app.settle_at = None;
+                    app.spawn_foreground_poll(true); // forced: bypass the throttle
                 }
                 if app.predict.deadline().is_some_and(|t| t <= now) {
                     app.predict.on_tick(); // wipe timed-out ghosts (no-echo prompts)
