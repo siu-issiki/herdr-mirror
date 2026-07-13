@@ -7,6 +7,7 @@
 
 use std::fmt::Write as _;
 use std::rc::Rc;
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Clone, PartialEq)]
 pub struct Cell {
@@ -84,11 +85,17 @@ impl Grid {
             }
             let ch = chars[i];
             if ch >= ' ' || ch == '\t' {
+                let ch = if ch == '\t' { ' ' } else { ch };
+                let w = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
                 if row < self.height && col < self.width {
-                    let ch = if ch == '\t' { ' ' } else { ch };
                     self.rows[row][col] = Some(Cell { sgr: sgr.clone(), ch });
+                    // wide char owns the next cell too: clear it so a stale narrow
+                    // char can't survive a delta that only rewrites the left cell
+                    if w == 2 && col + 1 < self.width {
+                        self.rows[row][col + 1] = None;
+                    }
                 }
-                col += 1;
+                col += w;
             }
             i += 1;
         }
@@ -196,14 +203,25 @@ impl Renderer {
             let cells = grid.rows.get(r + offset_r).unwrap_or(&empty);
             let mut line = String::new();
             let mut prev_sgr: Option<&str> = None;
-            for c in 0..out_cols.min(grid.width) {
+            let limit = out_cols.min(grid.width);
+            let mut c = 0;
+            while c < limit {
                 let cell = cells.get(c).and_then(|c| c.as_ref());
                 let sgr = cell.map(|c| &*c.sgr).unwrap_or("\x1b[0m");
                 if prev_sgr != Some(sgr) {
                     line.push_str(if sgr.is_empty() { "\x1b[0m" } else { sgr });
                     prev_sgr = Some(sgr);
                 }
-                line.push(cell.map(|c| c.ch).unwrap_or(' '));
+                let ch = cell.map(|c| c.ch).unwrap_or(' ');
+                let w = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
+                if w == 2 && c + 1 >= limit {
+                    // a wide char at the right edge would overflow the pane
+                    line.push(' ');
+                    c += 1;
+                    continue;
+                }
+                line.push(ch);
+                c += w;
             }
             let is_status_row = r == out_rows - 1 && !self.status_text.is_empty();
             let painted = if is_status_row {
@@ -297,5 +315,42 @@ mod tests {
         // unchanged rows are not repainted
         let out3 = r.paint(&g, 5, 3);
         assert!(!out3.contains("last"));
+    }
+
+    #[test]
+    fn wide_chars_advance_two_cells() {
+        let mut g = Grid::new();
+        g.resize(10, 2);
+        // wire format: wide char emitted once, next CUP jumps 2 columns
+        g.apply("\x1b[1;1H\x1b[0mあ\x1b[1;3Hい\x1b[1;5Hx");
+        assert_eq!(g.rows[0][0].as_ref().unwrap().ch, 'あ');
+        assert!(g.rows[0][1].is_none());
+        assert_eq!(g.rows[0][2].as_ref().unwrap().ch, 'い');
+        assert_eq!(g.rows[0][4].as_ref().unwrap().ch, 'x');
+        // run without CUP: col must advance by display width
+        g.apply("\x1b[2;1Hあい");
+        assert_eq!(g.rows[1][2].as_ref().unwrap().ch, 'い');
+        assert_eq!((g.cursor_row, g.cursor_col), (1, 4));
+    }
+
+    #[test]
+    fn renderer_skips_wide_spacer_cells() {
+        let mut g = Grid::new();
+        g.resize(6, 1);
+        g.apply("\x1b[1;1H\x1b[0mあ\x1b[1;3Hい\x1b[1;5Hx");
+        let mut r = Renderer::new();
+        let out = r.paint(&g, 6, 1);
+        // spacer cells must not be painted: terminal column stays aligned
+        assert!(out.contains("あいx"));
+    }
+
+    #[test]
+    fn wide_char_overwrite_clears_spacer() {
+        let mut g = Grid::new();
+        g.resize(6, 1);
+        g.apply("\x1b[1;1Hab");
+        g.apply("\x1b[1;1Hあ");
+        assert_eq!(g.rows[0][0].as_ref().unwrap().ch, 'あ');
+        assert!(g.rows[0][1].is_none());
     }
 }
