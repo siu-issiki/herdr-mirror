@@ -16,13 +16,21 @@
 // These create REMOTE objects only; the daemon mirrors them back within a
 // couple of seconds. Local mirror objects stay daemon-owned.
 
+use std::time::Duration;
+
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::api::ApiClient;
 use crate::config::{load_config, HostConfig};
 use crate::remote::RemoteHost;
-use crate::state::load_state;
+use crate::state::{load_state, HostState};
 use crate::util::{err, Env, Result};
+
+/// how often (and how long) to poll the host state file for the daemon's
+/// mirror of a just-created remote object, before giving up on focusing it
+const MIRROR_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MIRROR_POLL_TIMEOUT: Duration = Duration::from_millis(4000);
 
 #[derive(Debug, Default, Deserialize)]
 struct InvocationContext {
@@ -106,26 +114,31 @@ pub async fn run(env: Env, kind: &str, direction: Option<&str>) -> Result<()> {
         }
     }
 
-    match kind {
+    let new_remote_id: Option<String> = match kind {
         "workspace" => {
             let res: Value = api.request("workspace.create", json!({ "cwd": cwd, "focus": false })).await?;
+            let remote_id =
+                res.pointer("/workspace/workspace_id").and_then(|v| v.as_str()).map(String::from);
             println!(
                 "created workspace {} ({}) on {}; mirror follows shortly",
                 res.pointer("/workspace/label").and_then(|v| v.as_str()).unwrap_or("?"),
-                res.pointer("/workspace/workspace_id").and_then(|v| v.as_str()).unwrap_or("?"),
+                remote_id.as_deref().unwrap_or("?"),
                 host.name
             );
+            remote_id
         }
         "tab" => {
             let ws = resolved.as_ref().and_then(|r| r.remote_ws_id.clone()).unwrap();
             let res: Value = api
                 .request("tab.create", json!({ "workspace_id": ws, "cwd": cwd, "focus": false }))
                 .await?;
+            let remote_id = res.pointer("/tab/tab_id").and_then(|v| v.as_str()).map(String::from);
             println!(
                 "created tab {} in {}: {ws}; mirror follows shortly",
-                res.pointer("/tab/tab_id").and_then(|v| v.as_str()).unwrap_or("?"),
+                remote_id.as_deref().unwrap_or("?"),
                 host.name
             );
+            remote_id
         }
         "split" => {
             let Some(pane_id) = resolved.as_ref().and_then(|r| r.remote_pane_id.clone()) else {
@@ -138,15 +151,98 @@ pub async fn run(env: Env, kind: &str, direction: Option<&str>) -> Result<()> {
                     json!({ "target_pane_id": pane_id, "direction": dir, "cwd": cwd, "focus": false }),
                 )
                 .await?;
+            let remote_id = res.pointer("/pane/pane_id").and_then(|v| v.as_str()).map(String::from);
             println!(
                 "split {pane_id} {dir} on {} → {}; mirror follows shortly",
                 host.name,
-                res.pointer("/pane/pane_id").and_then(|v| v.as_str()).unwrap_or("ok")
+                remote_id.as_deref().unwrap_or("ok")
             );
+            remote_id
         }
         _ => return Err(err(format!("unknown remote action: {kind}"))),
+    };
+
+    // Native split/new-tab/new-workspace all move focus to the freshly
+    // created object; match that here even though the object we just made is
+    // remote and its local mirror doesn't exist yet — the daemon creates it
+    // within a couple hundred ms. Best-effort only: any failure or timeout is
+    // swallowed so it never turns a successful remote-create into an error.
+    if let Some(remote_id) = new_remote_id {
+        focus_new_mirror(&env, &host.name, kind, &remote_id).await;
     }
     Ok(())
+}
+
+/// Look up the local mirror id for a freshly-created remote object, if the
+/// daemon's converge has already mapped it (and, for workspaces/panes, the
+/// mapping isn't a tombstone). Kept as a plain sync function over `HostState`
+/// so the polling logic can be unit-tested without an async runtime.
+fn lookup_mirror_local_id(state: &HostState, kind: &str, remote_id: &str) -> Option<String> {
+    match kind {
+        "workspace" => state.workspaces.get(remote_id).filter(|e| !e.is_tombstoned()).map(|e| e.local_id.clone()),
+        "tab" => state.tabs.get(remote_id).map(|e| e.local_id.clone()),
+        "split" => state.panes.get(remote_id).filter(|e| !e.is_tombstoned()).map(|e| e.local_id.clone()),
+        _ => None,
+    }
+}
+
+/// Poll the host state file until the daemon has mirrored `remote_id`
+/// locally, or give up after MIRROR_POLL_TIMEOUT.
+async fn wait_for_mirror_local_id(env: &Env, host: &str, kind: &str, remote_id: &str) -> Option<String> {
+    wait_for_mirror_local_id_with_timeout(env, host, kind, remote_id, MIRROR_POLL_TIMEOUT).await
+}
+
+/// Same as `wait_for_mirror_local_id`, but with an explicit timeout — split
+/// out so tests can exercise the give-up path without waiting 4 real seconds.
+async fn wait_for_mirror_local_id_with_timeout(
+    env: &Env,
+    host: &str,
+    kind: &str,
+    remote_id: &str,
+    poll_timeout: Duration,
+) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + poll_timeout;
+    loop {
+        let state = load_state(&env.state_dir, host);
+        if let Some(local_id) = lookup_mirror_local_id(&state, kind, remote_id) {
+            return Some(local_id);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(MIRROR_POLL_INTERVAL).await;
+    }
+}
+
+/// Best-effort: once the daemon mirrors a just-created remote object
+/// locally, move local focus onto it — mirroring native new-workspace/new-tab
+/// /split behavior. Never propagates an error: a timeout or API failure is
+/// logged and swallowed, since the remote object was already created
+/// successfully regardless of whether we can focus its mirror.
+async fn focus_new_mirror(env: &Env, host: &str, kind: &str, remote_id: &str) {
+    let Some(local_id) = wait_for_mirror_local_id(env, host, kind, remote_id).await else {
+        println!("mirror focus timed out waiting for the {kind} mirror of {remote_id}");
+        return;
+    };
+    let local = match ApiClient::connect(&env.local_socket).await {
+        Ok(c) => c,
+        Err(e) => {
+            println!("mirror focus: could not connect to local herdr: {e}");
+            return;
+        }
+    };
+    // tab.focus verified against a live herdr socket (preview 2026-06-30):
+    // {"method":"tab.focus","params":{"tab_id":...}} focuses the tab (and its
+    // workspace). No fallback needed.
+    let result = match kind {
+        "workspace" => local.request("workspace.focus", json!({ "workspace_id": local_id })).await,
+        "tab" => local.request("tab.focus", json!({ "tab_id": local_id })).await,
+        "split" => local.request("pane.focus", json!({ "pane_id": local_id })).await,
+        _ => return,
+    };
+    if let Err(e) = result {
+        println!("mirror focus failed: {e}");
+    }
 }
 
 #[cfg(test)]
@@ -226,6 +322,104 @@ mod tests {
         let r2 = resolve_context(&env, &hosts, &ctx2).expect("resolves");
         assert_eq!(r2.remote_pane_id.as_deref(), Some("wR:pR2"));
         assert_eq!(r2.remote_pane_cwd, None);
+
+        std::fs::remove_dir_all(&env.state_dir).ok();
+    }
+
+    fn ws_entry(local_id: &str, tombstoned: bool) -> WsEntry {
+        WsEntry {
+            local_id: local_id.into(),
+            tombstone: tombstoned.then_some(true),
+            root_tab_local_id: None,
+            last_remote_label: None,
+        }
+    }
+
+    fn pane_entry(local_id: &str, tombstoned: bool) -> PaneEntry {
+        PaneEntry {
+            local_id: local_id.into(),
+            tombstone: tombstoned.then_some(true),
+            seq: 0,
+            reported: None,
+            cwd: None,
+        }
+    }
+
+    /// lookup_mirror_local_id surfaces the local id for each object kind once
+    /// the daemon has written it into the host state map.
+    #[test]
+    fn lookup_mirror_local_id_finds_mapped_objects() {
+        let mut state = HostState::default();
+        state.workspaces.insert("wR".into(), ws_entry("wL", false));
+        state.tabs.insert("wR:tR".into(), crate::state::TabEntry { local_id: "wL:tL".into() });
+        state.panes.insert("wR:pR".into(), pane_entry("wL:pL", false));
+
+        assert_eq!(lookup_mirror_local_id(&state, "workspace", "wR").as_deref(), Some("wL"));
+        assert_eq!(lookup_mirror_local_id(&state, "tab", "wR:tR").as_deref(), Some("wL:tL"));
+        assert_eq!(lookup_mirror_local_id(&state, "split", "wR:pR").as_deref(), Some("wL:pL"));
+    }
+
+    /// Not-yet-mirrored objects (absent from the map) yield None, so the
+    /// caller keeps polling instead of focusing a stale/nonexistent id.
+    #[test]
+    fn lookup_mirror_local_id_absent_yields_none() {
+        let state = HostState::default();
+        assert_eq!(lookup_mirror_local_id(&state, "workspace", "wR"), None);
+        assert_eq!(lookup_mirror_local_id(&state, "tab", "wR:tR"), None);
+        assert_eq!(lookup_mirror_local_id(&state, "split", "wR:pR"), None);
+        assert_eq!(lookup_mirror_local_id(&state, "bogus-kind", "wR"), None);
+    }
+
+    /// A tombstoned workspace/pane mapping means "the user closed this
+    /// mirror" — never treat it as the freshly-created object's mirror.
+    #[test]
+    fn lookup_mirror_local_id_ignores_tombstones() {
+        let mut state = HostState::default();
+        state.workspaces.insert("wR".into(), ws_entry("wL", true));
+        state.panes.insert("wR:pR".into(), pane_entry("wL:pL", true));
+
+        assert_eq!(lookup_mirror_local_id(&state, "workspace", "wR"), None);
+        assert_eq!(lookup_mirror_local_id(&state, "split", "wR:pR"), None);
+    }
+
+    /// wait_for_mirror_local_id polls the state file and returns as soon as
+    /// the daemon writes the mapping, without waiting for the full timeout.
+    #[tokio::test]
+    async fn wait_for_mirror_local_id_picks_up_a_delayed_write() {
+        let env = tmp_env();
+        let host_name = "h1";
+
+        let state_dir = env.state_dir.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            let mut state = HostState::default();
+            state.workspaces.insert("wR".into(), ws_entry("wL", false));
+            save_state(&state_dir, host_name, &state).unwrap();
+        });
+
+        let started = std::time::Instant::now();
+        let found = wait_for_mirror_local_id(&env, host_name, "workspace", "wR").await;
+        assert_eq!(found.as_deref(), Some("wL"));
+        // well under MIRROR_POLL_TIMEOUT: proves it returned on the poll that
+        // observed the write, not by exhausting the deadline
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        std::fs::remove_dir_all(&env.state_dir).ok();
+    }
+
+    /// An object that never gets mirrored (e.g. the daemon is down) times out
+    /// instead of hanging forever; the short timeout here is a local override
+    /// on top of the same polling logic `run` uses with MIRROR_POLL_TIMEOUT.
+    #[tokio::test]
+    async fn wait_for_mirror_local_id_times_out_when_never_mapped() {
+        let env = tmp_env();
+        let found = tokio::time::timeout(
+            Duration::from_millis(500),
+            wait_for_mirror_local_id_with_timeout(&env, "h1", "workspace", "wR-never", Duration::from_millis(150)),
+        )
+        .await
+        .expect("inner poll loop itself must respect its own timeout");
+        assert_eq!(found, None);
 
         std::fs::remove_dir_all(&env.state_dir).ok();
     }
