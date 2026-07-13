@@ -494,11 +494,25 @@ fn pane_is_mirror(p: &PaneInfo) -> bool {
 
 // --- the converge pass ---
 
+/// True when `rid` is missing from `present` (this converge pass) but was
+/// present in `prev_ids` (the previous pass) — a first-time absence that
+/// `absent_twice`-style logic won't act on yet.
+fn absent_once(rid: &str, present: &HashSet<&str>, prev_ids: &std::collections::BTreeSet<String>) -> bool {
+    !present.contains(rid) && prev_ids.contains(rid)
+}
+
 /// Post-converge state plus the git-branch probe targets: `(remote_ws_id, remote
 /// cwd)` for each mirrored workspace, fed to `sync_branches` after the pass.
 pub struct ConvergeOutcome {
     pub state: HostState,
     pub branch_probes: Vec<(String, String)>,
+    /// True when this pass observed at least one workspace/tab/pane that is
+    /// missing from the remote snapshot for the first time (present in the
+    /// previous pass, absent now) — i.e. an `absent_twice`-style close didn't
+    /// fire yet, but might on the very next converge, so the caller should
+    /// schedule a quick follow-up converge instead of waiting for the next
+    /// regular poll.
+    pub pending_absences: bool,
 }
 
 /// Returns the post-converge state so callers don't re-read the state file.
@@ -507,10 +521,10 @@ pub async fn converge(deps: &ConvergeDeps) -> Result<ConvergeOutcome> {
     let result = converge_inner(deps, &mut state).await;
     // save even on error: a crash mid-pass must not orphan created mirrors
     save_state(&deps.state_dir, &deps.host.name, &state)?;
-    result.map(|branch_probes| ConvergeOutcome { state, branch_probes })
+    result.map(|(branch_probes, pending_absences)| ConvergeOutcome { state, branch_probes, pending_absences })
 }
 
-async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<Vec<(String, String)>> {
+async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<(Vec<(String, String)>, bool)> {
     let host = &deps.host;
     let log = &deps.log;
     let (remote_snap, local_snap) =
@@ -597,6 +611,13 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<Ve
     let absent_twice = |rid: &str, present: &HashSet<&str>| {
         !present.contains(rid) && !prev_ids.contains(rid)
     };
+    // first-time absence: missing from this snapshot but present in the
+    // previous one. absent_twice (below) won't close these yet, but the very
+    // next converge might — the caller uses this to schedule a quick
+    // follow-up instead of waiting for the next regular poll.
+    let pending_absences = state.workspaces.keys().any(|rid| absent_once(rid, &remote_ws_ids, &prev_ids))
+        || state.tabs.keys().any(|rid| absent_once(rid, &remote_tab_ids, &prev_ids))
+        || state.panes.keys().any(|rid| absent_once(rid, &remote_pane_ids, &prev_ids));
     let gone_ws: Vec<String> =
         state.workspaces.keys().filter(|rid| absent_twice(rid, &remote_ws_ids)).cloned().collect();
     for rid in gone_ws {
@@ -914,7 +935,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<Ve
 
     // 5. push authoritative agent status onto mirror panes
     push_statuses(deps, &remote_snap, state).await;
-    Ok(branch_probes)
+    Ok((branch_probes, pending_absences))
 }
 
 /// `(remote_ws_id, remote cwd)` for each mirrored workspace: skip mutual-mirror
@@ -1263,6 +1284,19 @@ mod tests {
         assert_eq!(info.display_agent.as_deref(), Some("Claude"));
         assert_eq!(info.name.as_deref(), Some("fix the bug")); // title -> name
         assert!(info.has_agent());
+    }
+
+    #[test]
+    fn absent_once_detects_first_time_absence_only() {
+        let present: HashSet<&str> = HashSet::from(["p1", "p2"]);
+        let prev_ids: std::collections::BTreeSet<String> =
+            ["p1", "p3"].iter().map(|s| s.to_string()).collect();
+        // absent now, present last pass → first-time absence
+        assert!(absent_once("p3", &present, &prev_ids));
+        // present now → not absent at all, regardless of prev_ids
+        assert!(!absent_once("p1", &present, &prev_ids));
+        // absent now, but also absent last pass → not first-time (absent_twice's job)
+        assert!(!absent_once("p4", &present, &prev_ids));
     }
 
     // simulate herdr's move_workspace(source, insert_index) on an id list

@@ -155,11 +155,13 @@ async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
 
 /// Converge, then refresh mirror-workspace sidebar branches in one ssh exec.
 /// `branch_cache` persists across converges within a connection so unchanged
-/// branches skip a HEAD rewrite. Returns the post-converge state.
+/// branches skip a HEAD rewrite. Returns the post-converge state and whether
+/// a first-time absence was observed (so the caller can schedule a fast
+/// follow-up converge instead of waiting for the next regular poll).
 async fn converge_and_branches(
     deps: &ConvergeDeps,
     branch_cache: &mut HashMap<String, Option<String>>,
-) -> Result<HostState> {
+) -> Result<(HostState, bool)> {
     let outcome = converge(deps).await?;
     let ctl = deps.state_dir.join(format!("{}.ctl", deps.host.name));
     sync_branches(
@@ -172,7 +174,7 @@ async fn converge_and_branches(
         &deps.log,
     )
     .await;
-    Ok(outcome.state)
+    Ok((outcome.state, outcome.pending_absences))
 }
 
 /// Connected phase: subscribe, converge, then react to events/pokes/timers
@@ -200,16 +202,19 @@ async fn run_connected(
     let mut subscribed_key = String::from("<broadcast>");
     // remote_ws_id -> last-applied sidebar branch; persists across this
     // connection's converges so unchanged branches skip a HEAD rewrite
-    let mut branch_cache: HashMap<String, Option<String>> = HashMap::new();
-    let state = converge_and_branches(&deps, &mut branch_cache).await?;
-    resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
-    ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
-
     let mut converge_at: Option<Instant> = None;
     let mut status_at: Option<Instant> = None;
     let mut closes_at: Option<Instant> = None;
     let mut pending_status: HashMap<String, Value> = HashMap::new();
     let mut pending_closes: Vec<String> = Vec::new();
+
+    let mut branch_cache: HashMap<String, Option<String>> = HashMap::new();
+    let (state, pending_absences) = converge_and_branches(&deps, &mut branch_cache).await?;
+    if pending_absences {
+        converge_at.get_or_insert(Instant::now() + Duration::from_millis(1000));
+    }
+    resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
+    ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
 
     loop {
         let sleep = sleep_until_earliest([converge_at, status_at, closes_at]);
@@ -227,8 +232,12 @@ async fn run_connected(
                         }
                     }
                     // explicit remote closes are authoritative: remove the mirror
-                    // directly instead of inferring it from snapshot absence
-                    Some(e) if matches!(e.event.as_str(), "workspace_closed" | "tab_closed" | "pane_closed") => {
+                    // directly instead of inferring it from snapshot absence.
+                    // pane_exited: auto-close (process exit) never emits a
+                    // *_closed event from herdr, so treat pane_exited itself as
+                    // the authoritative pane close. If the remote pane somehow
+                    // survives, converge's self-healing recreates the mirror.
+                    Some(e) if matches!(e.event.as_str(), "workspace_closed" | "tab_closed" | "pane_closed" | "pane_exited") => {
                         let key = match e.event.as_str() {
                             "workspace_closed" => "workspace_id",
                             "tab_closed" => "tab_id",
@@ -266,7 +275,15 @@ async fn run_connected(
                 }
                 if converge_at.is_some_and(|t| t <= now) {
                     converge_at = None;
-                    let state = converge_and_branches(&deps, &mut branch_cache).await?;
+                    let (state, pending_absences) = converge_and_branches(&deps, &mut branch_cache).await?;
+                    if pending_absences {
+                        // a workspace/tab/pane was missing for the first time this
+                        // pass — absent_twice needs one more converge to confirm
+                        // and close it; schedule that promptly instead of waiting
+                        // for the next regular poll (which can be up to
+                        // poll_seconds away)
+                        converge_at.get_or_insert(Instant::now() + Duration::from_millis(1000));
+                    }
                     // pane set may have changed
                     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
                 }
