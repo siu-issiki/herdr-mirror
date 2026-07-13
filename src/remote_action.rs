@@ -20,7 +20,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::config::{load_config, HostConfig};
-use crate::mirror::fetch_snapshot;
 use crate::remote::RemoteHost;
 use crate::state::load_state;
 use crate::util::{err, Env, Result};
@@ -82,15 +81,19 @@ pub async fn run(env: Env, kind: &str, direction: Option<&str>) -> Result<()> {
         .ok_or_else(|| err("no hosts configured"))?;
 
     let mut remote = RemoteHost::new(&host, &env.state_dir);
-    let (api, _status) = remote.connect_api().await?;
+    let api = remote.connect_api_fast().await?;
 
     // cwd inheritance comes from the REMOTE side: the remote pane behind the
     // focused mirror pane knows its real cwd; local cwds are meaningless there
     let mut cwd: Option<String> = None;
     if let Some(pane_id) = resolved.as_ref().and_then(|r| r.remote_pane_id.clone()) {
-        let snap = fetch_snapshot(&api).await?;
-        if let Some(pane) = snap.panes.iter().find(|p| p.pane_id == pane_id) {
-            cwd = pane.foreground_cwd.clone().or_else(|| pane.cwd.clone());
+        // one pane.get instead of a full snapshot — this runs on every action
+        if let Ok(res) = api.request("pane.get", json!({ "pane_id": pane_id })).await {
+            cwd = res
+                .pointer("/pane/foreground_cwd")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| res.pointer("/pane/cwd").and_then(|v| v.as_str()).map(String::from));
         }
     }
 

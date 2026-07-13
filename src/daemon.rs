@@ -251,7 +251,7 @@ async fn run_connected(
                     Some(e) if matches!(e.event.as_str(), "workspace_created" | "tab_created" | "pane_created") => {
                         // creations are what the user is waiting on (e.g. a remote split
                         // reflecting back) — converge on the short debounce
-                        let at = Instant::now() + Duration::from_millis(150);
+                        let at = Instant::now() + Duration::from_millis(30);
                         if converge_at.is_none_or(|t| t > at) {
                             converge_at = Some(at);
                         }

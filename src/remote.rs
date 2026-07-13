@@ -212,6 +212,20 @@ impl RemoteHost {
         Ok((api, status))
     }
 
+    /// Fast path for short-lived action processes: if the daemon's forwarded
+    /// API socket is already alive, connect straight to it — the version was
+    /// validated when the forward was established. Falls back to the full
+    /// ensure_master → status → forward path.
+    pub async fn connect_api_fast(&mut self) -> Result<ApiClient> {
+        if self.fwd_sock.exists() {
+            if let Ok(api) = ApiClient::connect(&self.fwd_sock).await {
+                self.forwarded = true;
+                return Ok(api);
+            }
+        }
+        self.connect_api().await.map(|(api, _)| api)
+    }
+
 }
 
 fn nonempty(e: &str, code: i32) -> String {
