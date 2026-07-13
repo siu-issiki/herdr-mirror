@@ -3,10 +3,12 @@
 // herdr strips the mouse-mode DECSET from the frames the plugin observes, so the
 // streamer can't tell whether the remote pane's app wants the mouse. As a proxy,
 // query the remote pane's foreground process (`herdr pane process-info`) and
-// classify it: a plain shell at a prompt never enables mouse reporting, so mouse
-// events should stay local (no garbage in the prompt); anything else is treated
-// as a possible mouse-aware TUI and clicks are forwarded. This is a heuristic
-// stand-in until herdr exposes the pane's mouse-reporting state through the API.
+// classify it: a plain shell at a prompt, or a known agent CLI that renders
+// inline without mouse tracking, never enables mouse reporting, so mouse events
+// should stay local (no garbage in the prompt / native selection keeps
+// working); anything else is treated as a possible mouse-aware TUI and clicks
+// are forwarded. This is a heuristic stand-in until herdr exposes the pane's
+// mouse-reporting state through the API.
 
 use std::process::Stdio;
 
@@ -23,23 +25,46 @@ const SHELLS: &[&str] = &[
     "pwsh", "powershell", "cmd",
 ];
 
+/// Agent CLIs that render inline without mouse tracking: like shells, mouse
+/// events over them should stay local so native selection/copy keeps working.
+const AGENTS: &[&str] = &["claude", "codex", "gemini", "aider", "opencode", "goose", "amp"];
+
+/// Normalizes a login-shell dash (`-name`), a leading path, and a Windows
+/// `.exe` suffix, and lowercases the result, before matching against a list.
+fn normalize(name: &str) -> String {
+    let base = name.trim_start_matches('-').rsplit(['/', '\\']).next().unwrap_or(name);
+    base.trim_end_matches(".exe").to_ascii_lowercase()
+}
+
 /// Is `name` one of the known interactive shells? Normalizes a login-shell dash
 /// (`-bash`), a leading path, and a Windows `.exe` suffix before matching.
 pub fn is_shell(name: &str) -> bool {
-    let base = name.trim_start_matches('-').rsplit(['/', '\\']).next().unwrap_or(name);
-    let n = base.trim_end_matches(".exe").to_ascii_lowercase();
-    SHELLS.contains(&n.as_str())
+    SHELLS.contains(&normalize(name).as_str())
+}
+
+/// Is `name` one of the known agent CLIs (Claude Code, Codex, etc.)? Same
+/// normalization as `is_shell`.
+pub fn is_agent(name: &str) -> bool {
+    AGENTS.contains(&normalize(name).as_str())
 }
 
 /// Classify a `pane process-info` JSON response. `Some(true)` = foreground is a
-/// shell, `Some(false)` = something else, `None` = indeterminate (empty/unparseable).
+/// shell or known agent CLI (mouse stays local), `Some(false)` = something
+/// else (mouse forwarded), `None` = indeterminate (empty/unparseable).
+///
+/// Checks both `name` and `argv0` of the leaf process: some agent CLIs (e.g.
+/// Claude Code) report a version string like "2.1.207" as `name` but the
+/// actual program as `argv0` ("claude"), so `name` alone isn't reliable.
 pub fn classify(json: &str) -> Option<bool> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let fg = v.get("result")?.get("process_info")?.get("foreground_processes")?.as_array()?;
     // the last foreground process is the actually-running leaf, so `sudo vim`
     // classifies on `vim`, not `sudo`
-    let name = fg.last()?.get("name")?.as_str()?;
-    Some(is_shell(name))
+    let leaf = fg.last()?;
+    let name = leaf.get("name")?.as_str()?;
+    let argv0 = leaf.get("argv0").and_then(|v| v.as_str());
+    let matches = |n: &str| is_shell(n) || is_agent(n);
+    Some(matches(name) || argv0.is_some_and(matches))
 }
 
 /// Query the remote pane's foreground process over ssh and classify it. `None`
@@ -110,5 +135,28 @@ mod tests {
         assert_eq!(classify(r#"{"result":{"process_info":{"foreground_processes":[]}}}"#), None);
         assert_eq!(classify("not json"), None);
         assert_eq!(classify(r#"{"result":{}}"#), None);
+    }
+
+    #[test]
+    fn classify_recognizes_agent_cli_via_argv0() {
+        // real-world shape: Claude Code reports its version string as `name`
+        // ("2.1.207") but `argv0` is "claude", so classification must fall
+        // back to argv0 when name doesn't match a known shell/agent.
+        let claude = r#"{"result":{"process_info":{"foreground_processes":[
+            {"argv0":"node","name":"node","pid":23166},
+            {"argv":["claude","--resume","..."],"argv0":"claude","name":"2.1.207","pid":22661}
+        ]}}}"#;
+        assert_eq!(classify(claude), Some(true));
+
+        let vim = r#"{"result":{"process_info":{"foreground_processes":[
+            {"argv0":"vim","name":"vim","pid":1}
+        ]}}}"#;
+        assert_eq!(classify(vim), Some(false));
+
+        // shell classification still works when argv0 is present
+        let zsh = r#"{"result":{"process_info":{"foreground_processes":[
+            {"argv0":"zsh","name":"zsh","pid":1}
+        ]}}}"#;
+        assert_eq!(classify(zsh), Some(true));
     }
 }
