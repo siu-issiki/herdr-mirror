@@ -344,6 +344,142 @@ fn mirror_pane_cwd(state_dir: &std::path::Path) -> std::path::PathBuf {
     state_dir.join(MIRROR_CWD_MARKER)
 }
 
+/// Per-mirror-workspace proxy cwd: `state_dir/git/<host>/<remote_ws_id>/.mirror-pane`.
+/// The basename stays `.mirror-pane` so the loop guard (`pane_is_mirror`) still
+/// matches, but each mirror workspace gets its own directory so we can plant a
+/// per-workspace `.git/HEAD` and have herdr's sidebar show the remote's branch.
+fn mirror_ws_cwd(state_dir: &std::path::Path, host: &str, remote_ws_id: &str) -> std::path::PathBuf {
+    state_dir.join("git").join(host).join(remote_ws_id).join(MIRROR_CWD_MARKER)
+}
+
+/// The per-workspace proxy cwd as a string, ensuring the directory exists so a
+/// pane can be created with it as cwd without racing the git-HEAD writer.
+fn ensure_ws_cwd(state_dir: &std::path::Path, host: &str, remote_ws_id: &str) -> String {
+    let p = mirror_ws_cwd(state_dir, host, remote_ws_id);
+    let _ = std::fs::create_dir_all(&p);
+    p.display().to_string()
+}
+
+/// Remove a mirror workspace's proxy directory (git repo included) when its
+/// mirror is reaped. Removes the whole `<host>/<remote_ws_id>` subtree, i.e. the
+/// parent of the `.mirror-pane` marker.
+fn remove_ws_cwd(state_dir: &std::path::Path, host: &str, remote_ws_id: &str) {
+    if let Some(parent) = mirror_ws_cwd(state_dir, host, remote_ws_id).parent() {
+        let _ = std::fs::remove_dir_all(parent);
+    }
+}
+
+/// The `.git/HEAD` contents that make herdr's sidebar show `branch`.
+fn head_ref_line(branch: &str) -> String {
+    format!("ref: refs/heads/{branch}\n")
+}
+
+/// A branch name safe to write into `.git/HEAD` on one line. Names are not used
+/// as paths (no sanitization needed), but a newline/tab would corrupt the file
+/// or the batch parse, so reject those.
+fn valid_branch(b: &str) -> bool {
+    !b.is_empty() && !b.contains('\n') && !b.contains('\t')
+}
+
+/// Plant/refresh a minimal git repo at `<proxy>/.git` so herdr reads the branch
+/// straight from `.git/HEAD`. No git binary needed: an empty `objects/`/`refs/`
+/// plus a symbolic HEAD is exactly what herdr's sidebar reader wants (it renders
+/// the branch even for a zero-commit repo).
+fn write_git_head(proxy_cwd: &std::path::Path, branch: &str) -> std::io::Result<()> {
+    let git = proxy_cwd.join(".git");
+    std::fs::create_dir_all(git.join("objects"))?;
+    std::fs::create_dir_all(git.join("refs"))?;
+    std::fs::write(git.join("HEAD"), head_ref_line(branch))
+}
+
+/// Remove the planted git repo so herdr shows no branch (remote is detached HEAD
+/// or a non-git directory) — same look as before this feature.
+fn remove_git_repo(proxy_cwd: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(proxy_cwd.join(".git"));
+}
+
+/// Parse the branch-probe batch: one `<cwd>\t<branch-or-sentinel>` line per dir.
+/// `-`, empty, or an invalid (tab-bearing) branch → `None` (no branch to show).
+pub fn parse_branch_batch(stdout: &str) -> Vec<(String, Option<String>)> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (dir, branch) = line.split_once('\t')?;
+            let b = branch.strip_suffix('\r').unwrap_or(branch); // tolerate CRLF
+            let val = (b != "-" && valid_branch(b)).then(|| b.to_string());
+            Some((dir.to_string(), val))
+        })
+        .collect()
+}
+
+/// Probe the remote branches of all mirrored workspaces in ONE ssh exec (reusing
+/// the daemon's ControlMaster), then refresh each mirror workspace's planted git
+/// HEAD when it changed. `cache` (remote_ws_id -> last-applied branch, `None` =
+/// no repo) suppresses redundant writes. `probes` is `(remote_ws_id, remote cwd)`.
+pub async fn sync_branches(
+    ssh_target: &str,
+    ctl_path: &std::path::Path,
+    state_dir: &std::path::Path,
+    host_name: &str,
+    probes: &[(String, String)],
+    cache: &mut HashMap<String, Option<String>>,
+    log: &Logger,
+) {
+    if probes.is_empty() {
+        return;
+    }
+    // for d in 'cwd1' 'cwd2' ...; do <branch of $d or -> ; done  — one round trip,
+    // tab-separated output. -q makes symbolic-ref silent on detached/non-git.
+    let dirs = probes.iter().map(|(_, cwd)| sh_quote(cwd)).collect::<Vec<_>>().join(" ");
+    let script = format!(
+        "for d in {dirs}; do b=$(git -C \"$d\" symbolic-ref --short -q HEAD 2>/dev/null) || b=-; \
+         [ -n \"$b\" ] || b=-; printf '%s\\t%s\\n' \"$d\" \"$b\"; done"
+    );
+    // -S <ctl> reuses the master; with no master it connects directly (graceful).
+    let out = tokio::process::Command::new("ssh")
+        .arg("-S")
+        .arg(ctl_path)
+        .args(crate::remote::SSH_COMMON_OPTS)
+        .arg(ssh_target)
+        .arg(&script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await;
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        // ssh failed entirely — leave every planted HEAD and the cache untouched
+        // so a transient drop can't wipe branches off the sidebar
+        _ => {
+            log.log(&format!("[{host_name}] branch probe ssh failed"));
+            return;
+        }
+    };
+    let parsed = parse_branch_batch(&String::from_utf8_lossy(&out.stdout));
+    let by_cwd: HashMap<&str, &Option<String>> =
+        parsed.iter().map(|(d, b)| (d.as_str(), b)).collect();
+    for (ws, cwd) in probes {
+        // a dir missing from the output (shouldn't happen) is left as-is, not cleared
+        let Some(branch) = by_cwd.get(cwd.as_str()) else { continue };
+        let branch = (*branch).clone();
+        if cache.get(ws) == Some(&branch) {
+            continue; // unchanged since last write
+        }
+        let proxy = mirror_ws_cwd(state_dir, host_name, ws);
+        match &branch {
+            Some(b) => {
+                if let Err(e) = write_git_head(&proxy, b) {
+                    log.log(&format!("[{host_name}] write HEAD for {ws}: {e}"));
+                    continue; // don't cache a write we failed to make
+                }
+            }
+            None => remove_git_repo(&proxy),
+        }
+        cache.insert(ws.clone(), branch);
+    }
+}
+
 /// Is this remote pane another herdr-mirror's streamer pane? Read from the
 /// snapshot cwd marker — free, and race-free.
 fn pane_is_mirror(p: &PaneInfo) -> bool {
@@ -358,16 +494,23 @@ fn pane_is_mirror(p: &PaneInfo) -> bool {
 
 // --- the converge pass ---
 
+/// Post-converge state plus the git-branch probe targets: `(remote_ws_id, remote
+/// cwd)` for each mirrored workspace, fed to `sync_branches` after the pass.
+pub struct ConvergeOutcome {
+    pub state: HostState,
+    pub branch_probes: Vec<(String, String)>,
+}
+
 /// Returns the post-converge state so callers don't re-read the state file.
-pub async fn converge(deps: &ConvergeDeps) -> Result<HostState> {
+pub async fn converge(deps: &ConvergeDeps) -> Result<ConvergeOutcome> {
     let mut state = load_state(&deps.state_dir, &deps.host.name);
     let result = converge_inner(deps, &mut state).await;
     // save even on error: a crash mid-pass must not orphan created mirrors
     save_state(&deps.state_dir, &deps.host.name, &state)?;
-    result.map(|()| state)
+    result.map(|branch_probes| ConvergeOutcome { state, branch_probes })
 }
 
-async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()> {
+async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<Vec<(String, String)>> {
     let host = &deps.host;
     let log = &deps.log;
     let (remote_snap, local_snap) =
@@ -458,6 +601,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         state.workspaces.keys().filter(|rid| absent_twice(rid, &remote_ws_ids)).cloned().collect();
     for rid in gone_ws {
         let entry = state.workspaces.remove(&rid).unwrap();
+        remove_ws_cwd(&deps.state_dir, &host.name, &rid);
         if !entry.is_tombstoned() && local_ws_ids.contains(&entry.local_id) {
             log.log(&format!("remote workspace {rid} gone — closing mirror {}", entry.local_id));
             if let Err(e) = deps.local.request("workspace.close", json!({ "workspace_id": entry.local_id })).await {
@@ -598,10 +742,10 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 struct CreatedTab {
                     tab_id: String,
                 }
-                // same non-git marker cwd the mirror panes use, so the
-                // workspace's default pane never flashes a (misleading) sidebar
-                // git branch before layout.apply swaps in the real mirror panes
-                let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
+                // this workspace's own proxy cwd (basename still `.mirror-pane`,
+                // so the loop guard holds); sync_branches plants a `.git/HEAD`
+                // here so the sidebar shows the remote branch
+                let cwd = ensure_ws_cwd(&deps.state_dir, &host.name, &rws.workspace_id);
                 let created: Created = deps
                     .local
                     .request_t("workspace.create", json!({ "label": label, "cwd": cwd, "focus": false }))
@@ -644,9 +788,9 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             walk_pane_ids(&exported.layout.root, &mut remote_order);
 
             if !tab_exists {
-                // non-git cwd so herdr shows no (misleading) sidebar git status
-                // for the mirror; the pane exec's the streamer regardless
-                let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
+                // this workspace's own proxy cwd; sync_branches plants a
+                // `.git/HEAD` here so the sidebar shows the remote branch
+                let cwd = ensure_ws_cwd(&deps.state_dir, &host.name, &rtab.workspace_id);
                 let root = map_node(&exported.layout.root, &cwd);
                 let target_tab = ws_entry.root_tab_local_id.clone();
                 // tab_id and workspace_id are mutually exclusive on layout.apply
@@ -696,9 +840,9 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 // PLAIN split panes (not agent.start), then exec the streamer in.
                 // agent.start would set launch_argv and surface every plain
                 // terminal as a phantom "mirror" agent row.
-                // non-git cwd so herdr shows no (misleading) sidebar git status
-                // for the mirror; the pane exec's the streamer regardless
-                let cwd = mirror_pane_cwd(&deps.state_dir).display().to_string();
+                // this workspace's own proxy cwd; sync_branches plants a
+                // `.git/HEAD` here so the sidebar shows the remote branch
+                let cwd = ensure_ws_cwd(&deps.state_dir, &host.name, &rtab.workspace_id);
                 for rp in &remote_panes_in_tab {
                     if state.panes.contains_key(&rp.pane_id) {
                         continue;
@@ -763,9 +907,43 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         }
     }
 
+    // git-branch probe targets: for each mirrored (non mutual-mirror,
+    // non-tombstoned) remote workspace, its first pane's foreground cwd. The
+    // caller runs one ssh to read the branches and refresh the planted HEADs.
+    let branch_probes = collect_branch_probes(&remote_snap, &panes_by_ws, &mirror_ws_ids, state);
+
     // 5. push authoritative agent status onto mirror panes
     push_statuses(deps, &remote_snap, state).await;
-    Ok(())
+    Ok(branch_probes)
+}
+
+/// `(remote_ws_id, remote cwd)` for each mirrored workspace: skip mutual-mirror
+/// workspaces and ones we don't have a live (non-tombstoned) mirror for, and use
+/// the workspace's first pane's `foreground_cwd` (falling back to `cwd`).
+fn collect_branch_probes(
+    remote_snap: &Snapshot,
+    panes_by_ws: &HashMap<&str, Vec<&PaneInfo>>,
+    mirror_ws_ids: &HashSet<String>,
+    state: &HostState,
+) -> Vec<(String, String)> {
+    let mut probes = Vec::new();
+    for rws in &remote_snap.workspaces {
+        if mirror_ws_ids.contains(&rws.workspace_id) {
+            continue;
+        }
+        match state.workspaces.get(&rws.workspace_id) {
+            Some(e) if !e.is_tombstoned() => {}
+            _ => continue,
+        }
+        let Some(first) = panes_by_ws.get(rws.workspace_id.as_str()).and_then(|p| p.first()) else {
+            continue;
+        };
+        let cwd = first.foreground_cwd.clone().or_else(|| first.cwd.clone());
+        if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
+            probes.push((rws.workspace_id.clone(), cwd));
+        }
+    }
+    probes
 }
 
 /// Push one pane's authoritative status (or retract it when the remote agent
@@ -874,6 +1052,7 @@ pub async fn apply_remote_closes(
     for rid in closed {
         if let Some(entry) = state.workspaces.remove(rid) {
             changed = true;
+            remove_ws_cwd(state_dir, host_name, rid);
             if !entry.is_tombstoned() {
                 log.log(&format!("remote workspace {rid} closed — closing mirror {}", entry.local_id));
                 let _ = local.request("workspace.close", json!({ "workspace_id": entry.local_id })).await;
@@ -946,9 +1125,10 @@ pub async fn teardown(local: &ApiClient, state_dir: &std::path::Path, host_name:
     // remote. Manual close is unaffected: there the entry is still mapped when
     // the user closes it, so the intent still reaches the remote.
     save_state(state_dir, host_name, &HostState::default())?;
-    for entry in state.workspaces.values() {
+    for (rid, entry) in &state.workspaces {
         log.log(&format!("closing mirror workspace {}", entry.local_id));
         let _ = local.request("workspace.close", json!({ "workspace_id": entry.local_id })).await;
+        remove_ws_cwd(state_dir, host_name, rid);
     }
     Ok(())
 }
@@ -1138,6 +1318,122 @@ mod tests {
         assert_eq!(ws_rank("work: slice", &prefixes), 1);
         assert_eq!(ws_rank("vps: ~", &prefixes), 2);
         assert_eq!(ws_rank("utopia", &prefixes), 0); // local
+    }
+
+    #[test]
+    fn ws_cwd_keeps_mirror_marker_basename() {
+        // basename must stay `.mirror-pane` or the loop guard (pane_is_mirror) breaks
+        let p = mirror_ws_cwd(std::path::Path::new("/s"), "work", "w9");
+        assert_eq!(p.file_name().and_then(|f| f.to_str()), Some(MIRROR_CWD_MARKER));
+        assert_eq!(p, std::path::Path::new("/s/git/work/w9/.mirror-pane"));
+        // pane_is_mirror still classifies a pane whose cwd is a per-ws proxy
+        let pane = PaneInfo {
+            pane_id: "p".into(),
+            tab_id: "t".into(),
+            workspace_id: "w".into(),
+            label: None,
+            cwd: Some(p.display().to_string()),
+            foreground_cwd: None,
+        };
+        assert!(pane_is_mirror(&pane));
+    }
+
+    #[test]
+    fn head_ref_line_format() {
+        assert_eq!(head_ref_line("main"), "ref: refs/heads/main\n");
+        assert_eq!(head_ref_line("feature/x"), "ref: refs/heads/feature/x\n");
+    }
+
+    #[test]
+    fn valid_branch_rejects_newline_and_tab() {
+        assert!(valid_branch("main"));
+        assert!(valid_branch("feature/foo-bar"));
+        assert!(!valid_branch(""));
+        assert!(!valid_branch("a\nb"));
+        assert!(!valid_branch("a\tb"));
+    }
+
+    #[test]
+    fn parse_branch_batch_reads_sentinels_and_branches() {
+        let out = "\
+/home/u/proj\tmain
+/home/u/detached\t-
+/tmp/notgit\t-
+/home/u/feat\tfeature/x
+";
+        let parsed = parse_branch_batch(out);
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed[0], ("/home/u/proj".into(), Some("main".into())));
+        assert_eq!(parsed[1], ("/home/u/detached".into(), None)); // sentinel
+        assert_eq!(parsed[2], ("/tmp/notgit".into(), None));
+        assert_eq!(parsed[3], ("/home/u/feat".into(), Some("feature/x".into())));
+    }
+
+    #[test]
+    fn parse_branch_batch_tolerates_crlf_and_skips_malformed() {
+        // CRLF line endings (trailing \r stripped) and a line with no tab is dropped
+        let out = "/a\tmain\r\nno-tab-line\r\n/b\t-\r\n";
+        let parsed = parse_branch_batch(out);
+        assert_eq!(parsed, vec![("/a".into(), Some("main".into())), ("/b".into(), None)]);
+    }
+
+    #[test]
+    fn write_and_remove_git_head_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("herdr-mirror-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_git_head(&dir, "main").unwrap();
+        let head = std::fs::read_to_string(dir.join(".git").join("HEAD")).unwrap();
+        assert_eq!(head, "ref: refs/heads/main\n");
+        assert!(dir.join(".git").join("objects").is_dir());
+        assert!(dir.join(".git").join("refs").is_dir());
+        // rewrite with a different branch
+        write_git_head(&dir, "dev").unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join(".git").join("HEAD")).unwrap(), "ref: refs/heads/dev\n");
+        remove_git_repo(&dir);
+        assert!(!dir.join(".git").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_branch_probes_picks_first_pane_and_skips_mutual_and_untracked() {
+        let snap = Snapshot {
+            workspaces: vec![
+                WsInfo { workspace_id: "w1".into(), label: "a".into(), tab_count: None, pane_count: None, active_tab_id: None },
+                WsInfo { workspace_id: "w2".into(), label: "b".into(), tab_count: None, pane_count: None, active_tab_id: None },
+                WsInfo { workspace_id: "w3".into(), label: "c".into(), tab_count: None, pane_count: None, active_tab_id: None },
+            ],
+            tabs: vec![],
+            panes: vec![
+                // w1: first pane has a foreground_cwd → used
+                PaneInfo { pane_id: "w1:p1".into(), tab_id: "w1:t1".into(), workspace_id: "w1".into(), label: None, cwd: Some("/fallback".into()), foreground_cwd: Some("/proj".into()) },
+                PaneInfo { pane_id: "w1:p2".into(), tab_id: "w1:t1".into(), workspace_id: "w1".into(), label: None, cwd: Some("/other".into()), foreground_cwd: Some("/other".into()) },
+                // w2 is a mutual-mirror workspace → skipped
+                PaneInfo { pane_id: "w2:p1".into(), tab_id: "w2:t1".into(), workspace_id: "w2".into(), label: None, cwd: None, foreground_cwd: Some("/x".into()) },
+                // w3: no foreground_cwd → falls back to cwd
+                PaneInfo { pane_id: "w3:p1".into(), tab_id: "w3:t1".into(), workspace_id: "w3".into(), label: None, cwd: Some("/fb".into()), foreground_cwd: None },
+            ],
+            agents: vec![],
+            layouts: vec![],
+        };
+        let mut panes_by_ws: HashMap<&str, Vec<&PaneInfo>> = HashMap::new();
+        for p in &snap.panes {
+            panes_by_ws.entry(p.workspace_id.as_str()).or_default().push(p);
+        }
+        let mut mirror_ws_ids = HashSet::new();
+        mirror_ws_ids.insert("w2".to_string());
+        let mut state = HostState::default();
+        // w1 and w3 are mirrored; w-unknown isn't in state and is skipped
+        for w in ["w1", "w3"] {
+            state.workspaces.insert(
+                w.to_string(),
+                WsEntry { local_id: format!("L{w}"), tombstone: None, root_tab_local_id: None, last_remote_label: None },
+            );
+        }
+        let probes = collect_branch_probes(&snap, &panes_by_ws, &mirror_ws_ids, &state);
+        assert_eq!(
+            probes,
+            vec![("w1".into(), "/proj".into()), ("w3".into(), "/fb".into())]
+        );
     }
 
     /// An agent-exit event carries no agent + "unknown" status → has_agent()

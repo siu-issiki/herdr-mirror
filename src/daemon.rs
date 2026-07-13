@@ -27,7 +27,7 @@ use crate::api::{ApiClient, EventStream};
 use crate::config::{load_config, HostConfig};
 use crate::mirror::{
     apply_remote_closes, converge, mark_unknown, mirror_source, push_pane_status, regroup_sidebar,
-    teardown, AgentInfo, ConvergeDeps,
+    sync_branches, teardown, AgentInfo, ConvergeDeps,
 };
 use crate::state::{load_state, save_state, HostState};
 use crate::util::{err, now_iso, pid_alive, sleep_until_earliest, Env, Logger, Result};
@@ -153,6 +153,28 @@ async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
     need_converge
 }
 
+/// Converge, then refresh mirror-workspace sidebar branches in one ssh exec.
+/// `branch_cache` persists across converges within a connection so unchanged
+/// branches skip a HEAD rewrite. Returns the post-converge state.
+async fn converge_and_branches(
+    deps: &ConvergeDeps,
+    branch_cache: &mut HashMap<String, Option<String>>,
+) -> Result<HostState> {
+    let outcome = converge(deps).await?;
+    let ctl = deps.state_dir.join(format!("{}.ctl", deps.host.name));
+    sync_branches(
+        &deps.host.target,
+        &ctl,
+        &deps.state_dir,
+        &deps.host.name,
+        &outcome.branch_probes,
+        branch_cache,
+        &deps.log,
+    )
+    .await;
+    Ok(outcome.state)
+}
+
 /// Connected phase: subscribe, converge, then react to events/pokes/timers
 /// until the connection drops (returns Err).
 async fn run_connected(
@@ -176,7 +198,10 @@ async fn run_connected(
     // converge must prune the map before the per-pane upgrade
     let mut stream = remote.subscribe(sub_list(&[])).await?;
     let mut subscribed_key = String::from("<broadcast>");
-    let state = converge(&deps).await?;
+    // remote_ws_id -> last-applied sidebar branch; persists across this
+    // connection's converges so unchanged branches skip a HEAD rewrite
+    let mut branch_cache: HashMap<String, Option<String>> = HashMap::new();
+    let state = converge_and_branches(&deps, &mut branch_cache).await?;
     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
     ctx.log.log(&format!("[{}] connected and synced", ctx.host.name));
 
@@ -241,7 +266,7 @@ async fn run_connected(
                 }
                 if converge_at.is_some_and(|t| t <= now) {
                     converge_at = None;
-                    let state = converge(&deps).await?;
+                    let state = converge_and_branches(&deps, &mut branch_cache).await?;
                     // pane set may have changed
                     resubscribe(ctx, &remote, &mut stream, &mut subscribed_key, &state).await?;
                 }
@@ -534,7 +559,7 @@ pub async fn cmd_once(env: Env) -> Result<()> {
     for h in &config.hosts {
         let mut remote_host = crate::remote::RemoteHost::new(h, &env.state_dir);
         let (remote, _status) = remote_host.connect_api().await?;
-        converge(&ConvergeDeps {
+        let deps = ConvergeDeps {
             local: local.clone(),
             remote,
             host: h.clone(),
@@ -542,8 +567,10 @@ pub async fn cmd_once(env: Env) -> Result<()> {
             plugin_root: env.plugin_root.clone(),
             log: log.clone(),
             close_remote_on_local_close: config.close_remote_on_local_close,
-        })
-        .await?;
+        };
+        // one-shot: a throwaway cache means every mirror's branch is (re)written
+        let mut branch_cache = HashMap::new();
+        converge_and_branches(&deps, &mut branch_cache).await?;
         log.log(&format!("[{}] one-shot mirror complete", h.name));
     }
     Ok(())
