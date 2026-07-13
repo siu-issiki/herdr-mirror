@@ -126,6 +126,97 @@ impl Grid {
             })
             .collect()
     }
+
+    /// Extract the text of a linear (row-major) selection `[start, end]`, both in
+    /// grid coords with `start <= end` (see [`normalize_selection`]). Column
+    /// ranges follow ordinary terminal selection: the first row runs from its
+    /// column to the line end, whole middle rows, and the last row up to its
+    /// column; a single-row selection is just the column span. Wide-char spacer
+    /// cells (the empty cell trailing a width-2 char) are dropped so a CJK glyph
+    /// isn't doubled, each row is `trim_end`ed, and rows join with `\n`.
+    pub fn selection_text(&self, start: (usize, usize), end: (usize, usize)) -> String {
+        let (sr, sc) = start;
+        let (er, ec) = end;
+        let last = self.rows.len().saturating_sub(1);
+        let er = er.min(last);
+        let mut lines: Vec<String> = Vec::new();
+        let mut row = sr;
+        while row <= er {
+            let (c0, c1) = if sr == er {
+                (sc, ec)
+            } else if row == sr {
+                (sc, usize::MAX)
+            } else if row == er {
+                (0, ec)
+            } else {
+                (0, usize::MAX)
+            };
+            lines.push(self.row_text(row, c0, c1));
+            row += 1;
+        }
+        lines.join("\n")
+    }
+
+    /// Collect the characters of one row over the inclusive column range
+    /// `c0..=c1` (c1 saturates to the row's last cell). A wide-char spacer (a
+    /// `None` cell whose left neighbour is a width-2 char) is skipped; any other
+    /// `None` is a blank space. The result is `trim_end`ed.
+    fn row_text(&self, row: usize, c0: usize, c1: usize) -> String {
+        let Some(cells) = self.rows.get(row) else { return String::new() };
+        let hi = c1.min(cells.len().saturating_sub(1));
+        let mut s = String::new();
+        let mut col = c0;
+        while col <= hi {
+            match cells.get(col).and_then(|c| c.as_ref()) {
+                Some(cell) => s.push(cell.ch),
+                None => {
+                    let is_spacer = col > 0
+                        && cells[col - 1]
+                            .as_ref()
+                            .is_some_and(|c| UnicodeWidthChar::width(c.ch).unwrap_or(1) >= 2);
+                    if !is_spacer {
+                        s.push(' ');
+                    }
+                }
+            }
+            col += 1;
+        }
+        s.trim_end().to_string()
+    }
+}
+
+/// Grid row shown at the top of a bottom-anchored `out_rows`-tall window — the
+/// same offset [`Renderer::paint`] uses, so mouse coords can be mapped to grid
+/// cells consistently.
+pub fn window_offset(grid: &Grid, out_rows: usize) -> usize {
+    let bottom = grid.content_bottom.max(grid.cursor_row);
+    (bottom + 1).saturating_sub(out_rows)
+}
+
+/// Order an (anchor, current) pair into linear (row-major) `(start, end)` so
+/// `start <= end` regardless of drag direction.
+pub fn normalize_selection(
+    a: (usize, usize),
+    b: (usize, usize),
+) -> ((usize, usize), (usize, usize)) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Is grid cell `(row, col)` inside the linear selection `sel` = (start, end),
+/// start <= end? Middle rows select their whole width; the first/last row are
+/// bounded by the anchor/current columns.
+fn in_selection(row: usize, col: usize, sel: ((usize, usize), (usize, usize))) -> bool {
+    let ((sr, sc), (er, ec)) = sel;
+    if row < sr || row > er {
+        return false;
+    }
+    let lo = if row == sr { sc } else { 0 };
+    let hi = if row == er { ec } else { usize::MAX };
+    col >= lo && col <= hi
 }
 
 /// CSI: ESC [ <params: 0-9;:?> <final: alpha>. Returns (params, final, char len).
@@ -170,6 +261,10 @@ fn parse_osc(chars: &[char]) -> Option<usize> {
 pub struct Renderer {
     last_rows: Vec<Option<String>>,
     status_text: String,
+    /// active local drag-selection highlight, in grid coords `(start, end)` with
+    /// start <= end; painted cells inside it get reverse video. Changing it makes
+    /// the affected rows' painted strings differ, so paint's diff repaints them.
+    selection: Option<((usize, usize), (usize, usize))>,
 }
 
 impl Renderer {
@@ -186,11 +281,15 @@ impl Renderer {
         self.last_rows.pop(); // force bottom row repaint
     }
 
+    /// Set (or clear) the drag-selection highlight range, in grid coords.
+    pub fn set_selection(&mut self, sel: Option<((usize, usize), (usize, usize))>) {
+        self.selection = sel;
+    }
+
     /// Build the ANSI to paint the grid into an out_cols × out_rows terminal.
     /// Bottom-anchored window: agent TUIs live at the bottom of the screen.
     pub fn paint(&mut self, grid: &Grid, out_cols: usize, out_rows: usize) -> String {
-        let bottom = grid.content_bottom.max(grid.cursor_row);
-        let offset_r = (bottom + 1).saturating_sub(out_rows);
+        let offset_r = window_offset(grid, out_rows);
         let mut out = String::from("\x1b[?2026h\x1b[?25l");
         // paint every local row (missing rows blank-fill), or the pane stays
         // blank before the first frame and the status row is unreachable
@@ -203,14 +302,26 @@ impl Renderer {
             let cells = grid.rows.get(r + offset_r).unwrap_or(&empty);
             let mut line = String::new();
             let mut prev_sgr: Option<&str> = None;
+            let mut prev_rev = false;
+            let grow = r + offset_r;
             let limit = out_cols.min(grid.width);
             let mut c = 0;
             while c < limit {
                 let cell = cells.get(c).and_then(|c| c.as_ref());
                 let sgr = cell.map(|c| &*c.sgr).unwrap_or("\x1b[0m");
-                if prev_sgr != Some(sgr) {
+                let rev = self.selection.is_some_and(|sel| in_selection(grow, c, sel));
+                if prev_sgr != Some(sgr) || rev != prev_rev {
+                    // an SGR run doesn't reset reverse video on its own, so cancel
+                    // it explicitly when leaving a selected run
+                    if prev_rev && !rev {
+                        line.push_str("\x1b[27m");
+                    }
                     line.push_str(if sgr.is_empty() { "\x1b[0m" } else { sgr });
+                    if rev {
+                        line.push_str("\x1b[7m");
+                    }
                     prev_sgr = Some(sgr);
+                    prev_rev = rev;
                 }
                 let ch = cell.map(|c| c.ch).unwrap_or(' ');
                 let w = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
@@ -352,5 +463,57 @@ mod tests {
         g.apply("\x1b[1;1Hあ");
         assert_eq!(g.rows[0][0].as_ref().unwrap().ch, 'あ');
         assert!(g.rows[0][1].is_none());
+    }
+
+    #[test]
+    fn normalize_selection_orders_endpoints() {
+        // same row, current left of anchor
+        assert_eq!(normalize_selection((0, 5), (0, 2)), ((0, 2), (0, 5)));
+        // anchor below current: swap so start is the earlier row
+        assert_eq!(normalize_selection((3, 1), (1, 8)), ((1, 8), (3, 1)));
+        // already ordered
+        assert_eq!(normalize_selection((1, 2), (4, 0)), ((1, 2), (4, 0)));
+    }
+
+    #[test]
+    fn selection_text_single_row_column_span() {
+        let mut g = Grid::new();
+        g.resize(10, 2);
+        g.apply("\x1b[1;1Hhello world");
+        // columns 2..=6 → "llo w"
+        assert_eq!(g.selection_text((0, 2), (0, 6)), "llo w");
+    }
+
+    #[test]
+    fn selection_text_multi_row_linear() {
+        let mut g = Grid::new();
+        g.resize(8, 3);
+        g.apply("\x1b[1;1Habcdef\x1b[2;1Hmiddle\x1b[3;1Hxyz");
+        // start mid first row, whole middle row, up to col on last row
+        let text = g.selection_text((0, 3), (2, 1));
+        assert_eq!(text, "def\nmiddle\nxy");
+    }
+
+    #[test]
+    fn selection_text_excludes_wide_spacer() {
+        let mut g = Grid::new();
+        g.resize(8, 1);
+        // "あ" (wide) then "い" (wide) then "x": spacer cells must not be emitted
+        g.apply("\x1b[1;1H\x1b[0mあ\x1b[1;3Hい\x1b[1;5Hx");
+        // span the whole content: spacer at col 1 and col 3 are dropped
+        assert_eq!(g.selection_text((0, 0), (0, 5)), "あいx");
+    }
+
+    #[test]
+    fn selection_highlight_reverses_selected_cells_only() {
+        let mut g = Grid::new();
+        g.resize(6, 1);
+        g.apply("\x1b[1;1H\x1b[0mabcdef");
+        let mut r = Renderer::new();
+        r.set_selection(Some(((0, 1), (0, 3)))); // cols 1..=3 → "bcd"
+        let out = r.paint(&g, 6, 1);
+        // reverse video turned on inside the selection and off after it
+        assert!(out.contains("\x1b[7m"));
+        assert!(out.contains("\x1b[27m"));
     }
 }

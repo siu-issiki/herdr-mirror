@@ -38,7 +38,8 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::util::{err, Result};
-use crate::grid::{Grid, Renderer};
+use crate::foreground::Foreground;
+use crate::grid::{normalize_selection, window_offset, Grid, Renderer};
 use crate::predict::Predictor;
 
 // ---------------------------------------------------------------------------
@@ -151,9 +152,9 @@ enum Msg {
     Frame { gen: u64, frame: Frame },
     SessionExit { gen: u64, mode: Mode, reason: String, uptime: Duration },
     Stdin(Vec<u8>),
-    /// result of a background foreground-process poll: Some(true)=shell,
-    /// Some(false)=TUI, None=poll failed (keep last value)
-    Foreground(Option<bool>),
+    /// result of a background foreground-process poll: `Some(_)` = classified
+    /// (shell/agent/TUI), `None` = poll failed (keep last value)
+    Foreground(Option<Foreground>),
 }
 
 struct Session {
@@ -370,10 +371,17 @@ struct App {
     hint_clear_at: Option<Instant>,
     /// predictive local echo — draws keystrokes optimistically, frame-verified
     predict: Predictor,
-    /// remote pane foreground: Some(true)=shell (keep mouse local, no garbage),
-    /// Some(false)=TUI (forward clicks), None=unknown (fail safe to local).
-    /// Refreshed lazily on mouse activity via `herdr pane process-info`.
-    remote_is_shell: Option<bool>,
+    /// remote pane foreground classification (shell/agent/TUI), driving mouse
+    /// policy. `None` = unknown (fail safe: grab on, clicks dropped). Refreshed
+    /// lazily on mouse/keyboard activity via `herdr pane process-info`.
+    foreground: Option<Foreground>,
+    /// agent pane: a left-button press held until we learn it's a click (release
+    /// with no motion) or a drag (motion). Holds the raw press SGR bytes (to
+    /// forward on a click) and the anchor grid cell (for a drag selection).
+    mouse_pending: Option<(Vec<u8>, (usize, usize))>,
+    /// agent pane: an in-progress local drag selection as (anchor, current) grid
+    /// cells, unnormalized (drag direction preserved).
+    selecting: Option<((usize, usize), (usize, usize))>,
     /// last time a foreground poll was kicked off (throttles the ssh handshakes)
     fg_poll_at: Option<Instant>,
     /// scheduled delayed re-poll to catch a foreground change the last input just
@@ -444,19 +452,38 @@ impl App {
     }
 
     /// Match the local mouse grab to the classification: release it at a shell so
-    /// herdr does native selection/scroll, keep it grabbed for a TUI (or while
-    /// unknown) so clicks can be forwarded. Only writes on a change.
+    /// herdr does native selection/scroll; keep it grabbed for an agent CLI, a
+    /// TUI, or while unknown, so clicks/drags reach us. Only writes on a change.
     fn sync_mouse_grab(&mut self) {
         if !self.tty {
             return;
         }
-        // grab unless we've confirmed the foreground is a shell
-        let want = self.remote_is_shell != Some(true);
+        // grab unless we've confirmed the foreground is a plain shell
+        let want = self.foreground != Some(Foreground::Shell);
         if want == self.mouse_grabbed {
             return;
         }
         self.mouse_grabbed = want;
         write_stdout(if want { "\x1b[?1002h\x1b[?1006h" } else { "\x1b[?1002l" });
+    }
+
+    /// Map an SGR mouse position (1-based local terminal cell) to a grid cell,
+    /// using the same bottom-anchored window offset the renderer paints with.
+    fn mouse_to_grid(&self, x: u32, y: u32) -> (usize, usize) {
+        let (_cols, rows) = term_size();
+        let offset = window_offset(&self.grid, rows);
+        let row = (y as usize).saturating_sub(1) + offset;
+        let col = (x as usize).saturating_sub(1);
+        (row, col)
+    }
+
+    /// Push the current drag selection (if any) to the renderer and repaint. The
+    /// renderer diffs painted rows, so setting/clearing the highlight repaints
+    /// only the affected rows.
+    fn refresh_selection(&mut self) {
+        let sel = self.selecting.map(|(a, b)| normalize_selection(a, b));
+        self.renderer.set_selection(sel);
+        self.paint();
     }
 
     fn observe_size(&self) -> (usize, usize) {
@@ -672,35 +699,97 @@ impl App {
         // and re-check shortly after input settles, to catch a change the input
         // just caused (e.g. `:q` quitting vim — the poll above still sees vim)
         self.settle_at = Some(Instant::now() + SETTLE_DELAY);
-        // wheel becomes a semantic scroll (server decides app vs scrollback);
-        // clicks/drags forward to the remote pty only when the foreground is a
-        // TUI — at a shell they're dropped so they don't garbage the prompt
+        // per-classification mouse policy:
+        //  - Tui: forward every mouse event raw (the remote app owns the mouse)
+        //  - Agent: click → forward, left-drag → local select/copy (see below)
+        //  - Shell / unknown: wheel → semantic scroll, clicks dropped (kept local
+        //    so they don't garbage the prompt)
         let mut rest: Vec<u8> = Vec::with_capacity(buf.len());
         let mut i = 0usize;
         let mut scrolls: Vec<serde_json::Value> = Vec::new();
+        // set when a drag selection finalizes: text to copy locally (never sent)
+        let mut clip: Option<String> = None;
+        // set when the selection highlight changed and needs a repaint
+        let mut sel_dirty = false;
         while i < buf.len() {
             if let Some((btn, x, y, press, len)) = parse_mouse(&buf, i) {
-                if self.remote_is_shell == Some(false) {
-                    // remote foreground is a TUI → forward wheel and clicks raw
-                    rest.extend_from_slice(&buf[i..i + len]);
-                } else if press && (btn == 64 || btn == 65) {
-                    // shell / not-yet-classified: wheel becomes a semantic scroll
-                    scrolls.push(json!({
-                        "type": "terminal.scroll",
-                        "direction": if btn == 64 { "up" } else { "down" },
-                        "lines": 3,
-                        "source": "wheel",
-                        "column": x.saturating_sub(1),
-                        "row": y.saturating_sub(1),
-                        "modifiers": 0,
-                    }));
+                let seq = &buf[i..i + len];
+                match self.foreground {
+                    Some(Foreground::Tui) => rest.extend_from_slice(seq),
+                    Some(Foreground::Agent) => {
+                        if btn == 64 || btn == 65 {
+                            // wheel: cancel any pending press / in-progress select,
+                            // then forward raw so the remote agent scrolls
+                            if self.selecting.take().is_some() {
+                                sel_dirty = true;
+                            }
+                            self.mouse_pending = None;
+                            rest.extend_from_slice(seq);
+                        } else if btn == 0 && press {
+                            // left press: hold — could be a click or a drag start
+                            let anchor = self.mouse_to_grid(x, y);
+                            self.mouse_pending = Some((seq.to_vec(), anchor));
+                        } else if btn == 32 {
+                            // left-drag motion: enter/continue local selection
+                            let cur = self.mouse_to_grid(x, y);
+                            if let Some((_, anchor)) = self.mouse_pending.take() {
+                                self.selecting = Some((anchor, cur));
+                                sel_dirty = true;
+                            } else if let Some((anchor, _)) = self.selecting {
+                                self.selecting = Some((anchor, cur));
+                                sel_dirty = true;
+                            }
+                            // no pending/selecting → stray motion, ignore
+                        } else if btn == 0 && !press {
+                            // left release
+                            if let Some((anchor, cur)) = self.selecting.take() {
+                                // selection confirmed → copy locally, send nothing
+                                let (s, e) = normalize_selection(anchor, cur);
+                                let text = self.grid.selection_text(s, e);
+                                if !text.is_empty() {
+                                    clip = Some(text);
+                                }
+                                sel_dirty = true;
+                            } else if let Some((press_bytes, _)) = self.mouse_pending.take() {
+                                // click confirmed → forward press + release together
+                                rest.extend_from_slice(&press_bytes);
+                                rest.extend_from_slice(seq);
+                            } else {
+                                rest.extend_from_slice(seq);
+                            }
+                        } else {
+                            // right / middle / other buttons: forward raw
+                            rest.extend_from_slice(seq);
+                        }
+                    }
+                    _ => {
+                        // shell / not-yet-classified: wheel → semantic scroll
+                        if press && (btn == 64 || btn == 65) {
+                            scrolls.push(json!({
+                                "type": "terminal.scroll",
+                                "direction": if btn == 64 { "up" } else { "down" },
+                                "lines": 3,
+                                "source": "wheel",
+                                "column": x.saturating_sub(1),
+                                "row": y.saturating_sub(1),
+                                "modifiers": 0,
+                            }));
+                        }
+                        // else: click → drop (keep mouse local)
+                    }
                 }
-                // else: shell/unknown click → drop (keep mouse local)
                 i += len;
             } else {
                 rest.push(buf[i]);
                 i += 1;
             }
+        }
+        if sel_dirty {
+            self.refresh_selection();
+        }
+        if let Some(text) = clip {
+            copy_to_clipboard(&text);
+            self.hint("copied");
         }
         for s in scrolls {
             self.send(s).await;
@@ -713,6 +802,28 @@ impl App {
                 self.paint();
             }
         }
+    }
+}
+
+/// Copy `text` to the local clipboard. macOS uses `pbcopy`; elsewhere fall back
+/// to OSC 52 written to our own stdout. Best-effort — failures are ignored.
+fn copy_to_clipboard(text: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+            if let Some(mut si) = child.stdin.take() {
+                let _ = si.write_all(text.as_bytes());
+                // drop `si` here so pbcopy sees EOF before we wait
+            }
+            let _ = child.wait();
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let b64 = B64.encode(text.as_bytes());
+        write_stdout(&format!("\x1b]52;c;{b64}\x07"));
     }
 }
 
@@ -770,7 +881,9 @@ pub async fn run(args: Args) -> Result<()> {
         last_input: Instant::now(),
         hint_clear_at: None,
         predict: Predictor::new(),
-        remote_is_shell: None,
+        foreground: None,
+        mouse_pending: None,
+        selecting: None,
         fg_poll_at: None,
         settle_at: None,
         mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
@@ -808,7 +921,15 @@ pub async fn run(args: Args) -> Result<()> {
                     Some(Msg::Stdin(buf)) => app.handle_stdin(buf).await,
                     // keep the last good classification if a poll failed (None)
                     Some(Msg::Foreground(v)) => if v.is_some() {
-                        app.remote_is_shell = v;
+                        app.foreground = v;
+                        // left agent mode: drop any half-done click/drag and clear
+                        // a lingering selection highlight
+                        if v != Some(Foreground::Agent) {
+                            app.mouse_pending = None;
+                            if app.selecting.take().is_some() {
+                                app.refresh_selection();
+                            }
+                        }
                         app.sync_mouse_grab();
                     },
                 }

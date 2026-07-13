@@ -29,6 +29,19 @@ const SHELLS: &[&str] = &[
 /// events over them should stay local so native selection/copy keeps working.
 const AGENTS: &[&str] = &["claude", "codex", "gemini", "aider", "opencode", "goose", "amp"];
 
+/// Classification of a remote pane's foreground process, driving mouse policy:
+/// - `Shell`: interactive shell at a prompt — mouse stays local (native
+///   selection/scroll), the grab is released.
+/// - `Agent`: a known agent CLI (Claude Code, Codex, …) — grab stays on; a click
+///   forwards to the remote, a left-drag selects/copies locally.
+/// - `Tui`: anything else, assumed mouse-aware — all mouse events forwarded raw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Foreground {
+    Shell,
+    Agent,
+    Tui,
+}
+
 /// Normalizes a login-shell dash (`-name`), a leading path, and a Windows
 /// `.exe` suffix, and lowercases the result, before matching against a list.
 fn normalize(name: &str) -> String {
@@ -48,14 +61,13 @@ pub fn is_agent(name: &str) -> bool {
     AGENTS.contains(&normalize(name).as_str())
 }
 
-/// Classify a `pane process-info` JSON response. `Some(true)` = foreground is a
-/// shell or known agent CLI (mouse stays local), `Some(false)` = something
-/// else (mouse forwarded), `None` = indeterminate (empty/unparseable).
+/// Classify a `pane process-info` JSON response into a [`Foreground`]. `None` =
+/// indeterminate (empty/unparseable), so the caller keeps its last known value.
 ///
 /// Checks both `name` and `argv0` of the leaf process: some agent CLIs (e.g.
 /// Claude Code) report a version string like "2.1.207" as `name` but the
 /// actual program as `argv0` ("claude"), so `name` alone isn't reliable.
-pub fn classify(json: &str) -> Option<bool> {
+pub fn classify(json: &str) -> Option<Foreground> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let fg = v.get("result")?.get("process_info")?.get("foreground_processes")?.as_array()?;
     // the last foreground process is the actually-running leaf, so `sudo vim`
@@ -63,8 +75,15 @@ pub fn classify(json: &str) -> Option<bool> {
     let leaf = fg.last()?;
     let name = leaf.get("name")?.as_str()?;
     let argv0 = leaf.get("argv0").and_then(|v| v.as_str());
-    let matches = |n: &str| is_shell(n) || is_agent(n);
-    Some(matches(name) || argv0.is_some_and(matches))
+    let is_sh = is_shell(name) || argv0.is_some_and(is_shell);
+    let is_ag = is_agent(name) || argv0.is_some_and(is_agent);
+    Some(if is_sh {
+        Foreground::Shell
+    } else if is_ag {
+        Foreground::Agent
+    } else {
+        Foreground::Tui
+    })
 }
 
 /// Query the remote pane's foreground process over ssh and classify it. `None`
@@ -74,7 +93,7 @@ pub async fn poll(
     remote_bin: &str,
     pane: &str,
     ctl_path: Option<&str>,
-) -> Option<bool> {
+) -> Option<Foreground> {
     // remote_bin stays unquoted for remote-shell ~ expansion, matching the
     // observe session's command construction
     let cmd = format!("exec {} pane process-info --pane {}", remote_bin, sh_quote(pane));
@@ -121,13 +140,13 @@ mod tests {
     #[test]
     fn classify_reads_leaf_foreground() {
         let shell = r#"{"result":{"process_info":{"foreground_processes":[{"name":"zsh"}]}}}"#;
-        assert_eq!(classify(shell), Some(true));
+        assert_eq!(classify(shell), Some(Foreground::Shell));
         let tui = r#"{"result":{"process_info":{"foreground_processes":[{"name":"vim"}]}}}"#;
-        assert_eq!(classify(tui), Some(false));
+        assert_eq!(classify(tui), Some(Foreground::Tui));
         // sudo wrapper: the leaf is the real program
         let sudo =
             r#"{"result":{"process_info":{"foreground_processes":[{"name":"sudo"},{"name":"vim"}]}}}"#;
-        assert_eq!(classify(sudo), Some(false));
+        assert_eq!(classify(sudo), Some(Foreground::Tui));
     }
 
     #[test]
@@ -146,17 +165,17 @@ mod tests {
             {"argv0":"node","name":"node","pid":23166},
             {"argv":["claude","--resume","..."],"argv0":"claude","name":"2.1.207","pid":22661}
         ]}}}"#;
-        assert_eq!(classify(claude), Some(true));
+        assert_eq!(classify(claude), Some(Foreground::Agent));
 
         let vim = r#"{"result":{"process_info":{"foreground_processes":[
             {"argv0":"vim","name":"vim","pid":1}
         ]}}}"#;
-        assert_eq!(classify(vim), Some(false));
+        assert_eq!(classify(vim), Some(Foreground::Tui));
 
         // shell classification still works when argv0 is present
         let zsh = r#"{"result":{"process_info":{"foreground_processes":[
             {"argv0":"zsh","name":"zsh","pid":1}
         ]}}}"#;
-        assert_eq!(classify(zsh), Some(true));
+        assert_eq!(classify(zsh), Some(Foreground::Shell));
     }
 }
