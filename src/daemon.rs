@@ -153,6 +153,19 @@ async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
     need_converge
 }
 
+/// The tab id a `*_created` event lands in, for the converge layout prefetch.
+/// Tolerant of both a flat payload (`{tab_id: ...}`, matching the `*_closed`
+/// events) and a nested full object (`{pane: {tab_id: ...}}` / `{tab: {...}}`).
+/// `None` when no tab is identifiable (e.g. workspace_created) — the converge
+/// then just skips the prefetch and fetches layouts inline as before.
+fn created_tab_hint(data: &Value) -> Option<String> {
+    data.get("tab_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| data.pointer("/pane/tab_id").and_then(|v| v.as_str()))
+        .or_else(|| data.pointer("/tab/tab_id").and_then(|v| v.as_str()))
+        .map(String::from)
+}
+
 /// Converge, then refresh mirror-workspace sidebar branches in one ssh exec.
 /// `branch_cache` persists across converges within a connection so unchanged
 /// branches skip a HEAD rewrite. Returns the post-converge state and whether
@@ -161,8 +174,9 @@ async fn flush_status(ctx: &HostCtx, pending: HashMap<String, Value>) -> bool {
 async fn converge_and_branches(
     deps: &ConvergeDeps,
     branch_cache: &mut HashMap<String, Option<String>>,
+    prefetch_tabs: &[String],
 ) -> Result<(HostState, bool)> {
-    let outcome = converge(deps).await?;
+    let outcome = converge(deps, prefetch_tabs).await?;
     let ctl = deps.state_dir.join(format!("{}.ctl", deps.host.name));
     sync_branches(
         &deps.host.target,
@@ -209,7 +223,10 @@ async fn run_connected(
     let mut pending_closes: Vec<String> = Vec::new();
 
     let mut branch_cache: HashMap<String, Option<String>> = HashMap::new();
-    let (state, pending_absences) = converge_and_branches(&deps, &mut branch_cache).await?;
+    // tabs a pending creation touched — prefetch their layouts in the next
+    // converge so the layout.export overlaps the snapshot round-trip
+    let mut pending_layout_hints: Vec<String> = Vec::new();
+    let (state, pending_absences) = converge_and_branches(&deps, &mut branch_cache, &[]).await?;
     if pending_absences {
         converge_at.get_or_insert(Instant::now() + Duration::from_millis(1000));
     }
@@ -251,6 +268,11 @@ async fn run_connected(
                     Some(e) if matches!(e.event.as_str(), "workspace_created" | "tab_created" | "pane_created") => {
                         // creations are what the user is waiting on (e.g. a remote split
                         // reflecting back) — converge on the short debounce
+                        if let Some(tab) = created_tab_hint(&e.data) {
+                            if !pending_layout_hints.contains(&tab) {
+                                pending_layout_hints.push(tab);
+                            }
+                        }
                         let at = Instant::now() + Duration::from_millis(30);
                         if converge_at.is_none_or(|t| t > at) {
                             converge_at = Some(at);
@@ -283,7 +305,8 @@ async fn run_connected(
                 }
                 if converge_at.is_some_and(|t| t <= now) {
                     converge_at = None;
-                    let (state, pending_absences) = converge_and_branches(&deps, &mut branch_cache).await?;
+                    let hints = std::mem::take(&mut pending_layout_hints);
+                    let (state, pending_absences) = converge_and_branches(&deps, &mut branch_cache, &hints).await?;
                     if pending_absences {
                         // a workspace/tab/pane was missing for the first time this
                         // pass — absent_twice needs one more converge to confirm
@@ -595,7 +618,7 @@ pub async fn cmd_once(env: Env) -> Result<()> {
         };
         // one-shot: a throwaway cache means every mirror's branch is (re)written
         let mut branch_cache = HashMap::new();
-        converge_and_branches(&deps, &mut branch_cache).await?;
+        converge_and_branches(&deps, &mut branch_cache, &[]).await?;
         log.log(&format!("[{}] one-shot mirror complete", h.name));
     }
     Ok(())
@@ -660,4 +683,25 @@ pub async fn cmd_teardown(env: Env) -> Result<()> {
     }
     log.log("teardown complete (autostart paused until next start)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn created_tab_hint_reads_flat_and_nested() {
+        // flat shape, matching the *_closed events
+        assert_eq!(created_tab_hint(&json!({ "tab_id": "t7" })).as_deref(), Some("t7"));
+        // nested full pane object
+        assert_eq!(
+            created_tab_hint(&json!({ "pane": { "tab_id": "t9", "pane_id": "p1" } })).as_deref(),
+            Some("t9")
+        );
+        // nested tab object (tab_created)
+        assert_eq!(created_tab_hint(&json!({ "tab": { "tab_id": "t3" } })).as_deref(), Some("t3"));
+        // no tab identifiable (e.g. workspace_created) → no prefetch hint
+        assert_eq!(created_tab_hint(&json!({ "workspace_id": "w1" })), None);
+        assert_eq!(created_tab_hint(&Value::Null), None);
+    }
 }

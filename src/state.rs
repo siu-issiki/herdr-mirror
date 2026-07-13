@@ -25,6 +25,12 @@ pub struct PaneEntry {
     /// when the remote agent goes away, or it sticks forever
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reported: Option<String>,
+    /// the remote pane's cwd (foreground_cwd, else cwd) as of the last converge.
+    /// Cached here so remote-action cwd inheritance can skip a live `pane.get`
+    /// round-trip; a few seconds stale is acceptable. Daemon-owned — only
+    /// converge writes it; the action only reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 impl PaneEntry {
@@ -108,7 +114,7 @@ mod tests {
  },
  "tabs": { "w9:t1": { "localId": "t42" } },
  "panes": {
-  "w9:p1": { "localId": "w1234:p1", "seq": 12, "reported": "claude" },
+  "w9:p1": { "localId": "w1234:p1", "seq": 12, "reported": "claude", "cwd": "/home/me/proj" },
   "wB:p1": { "localId": "w5678:p1", "tombstone": true, "seq": 3 }
  }
 }"#;
@@ -118,14 +124,19 @@ mod tests {
         assert!(state.workspaces["wB"].is_tombstoned());
         assert_eq!(state.panes["w9:p1"].seq, 12);
         assert_eq!(state.panes["w9:p1"].reported.as_deref(), Some("claude"));
+        assert_eq!(state.panes["w9:p1"].cwd.as_deref(), Some("/home/me/proj"));
+        // absent cwd stays absent (backward compat with pre-upgrade files)
+        assert_eq!(state.panes["wB:p1"].cwd, None);
         assert!(state.panes["wB:p1"].is_tombstoned());
 
         let out = serde_json::to_string(&state).unwrap();
         let reparsed: HostState = serde_json::from_str(&out).unwrap();
         assert_eq!(reparsed.panes["w9:p1"].local_id, "w1234:p1");
+        assert_eq!(reparsed.panes["w9:p1"].cwd.as_deref(), Some("/home/me/proj"));
         assert!(out.contains("localId"));
         assert!(out.contains("rootTabLocalId"));
         // absent options stay absent
         assert!(!out.contains("\"reported\":null"));
+        assert!(!out.contains("\"cwd\":null"));
     }
 }

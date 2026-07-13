@@ -492,6 +492,31 @@ fn pane_is_mirror(p: &PaneInfo) -> bool {
     is_marker(&p.foreground_cwd) || is_marker(&p.cwd)
 }
 
+/// The cwd to cache for a remote pane: its live `foreground_cwd` if known,
+/// else the static `cwd`. This is what remote-action cwd inheritance wants
+/// (the shell's current directory, not just where it was launched).
+fn pane_snapshot_cwd(p: &PaneInfo) -> Option<String> {
+    p.foreground_cwd.clone().or_else(|| p.cwd.clone())
+}
+
+/// Prefetch the split-tree layout for each hinted tab, concurrently-friendly and
+/// best-effort: failures are dropped (the tab loop re-fetches on a cache miss).
+/// Deduplicates repeated tab ids. Runs alongside the session snapshot so the
+/// layout round-trip for a just-created pane overlaps the snapshot round-trip
+/// instead of following it.
+async fn prefetch_layouts(api: &ApiClient, tab_ids: &[String]) -> HashMap<String, LayoutNode> {
+    let mut out: HashMap<String, LayoutNode> = HashMap::new();
+    for tab_id in tab_ids {
+        if out.contains_key(tab_id) {
+            continue;
+        }
+        if let Some(root) = export_layout_root(api, tab_id).await {
+            out.insert(tab_id.clone(), root);
+        }
+    }
+    out
+}
+
 // --- the converge pass ---
 
 /// True when `rid` is missing from `present` (this converge pass) but was
@@ -516,19 +541,34 @@ pub struct ConvergeOutcome {
 }
 
 /// Returns the post-converge state so callers don't re-read the state file.
-pub async fn converge(deps: &ConvergeDeps) -> Result<ConvergeOutcome> {
+///
+/// `prefetch_tabs` names tabs whose layout should be fetched concurrently with
+/// the session snapshot — a creation fast-path hint (e.g. the tab a remote
+/// split just landed in). It is a pure latency optimization: converge stays the
+/// sole authority, and an empty slice reproduces the original behavior exactly.
+pub async fn converge(deps: &ConvergeDeps, prefetch_tabs: &[String]) -> Result<ConvergeOutcome> {
     let mut state = load_state(&deps.state_dir, &deps.host.name);
-    let result = converge_inner(deps, &mut state).await;
+    let result = converge_inner(deps, &mut state, prefetch_tabs).await;
     // save even on error: a crash mid-pass must not orphan created mirrors
     save_state(&deps.state_dir, &deps.host.name, &state)?;
     result.map(|(branch_probes, pending_absences)| ConvergeOutcome { state, branch_probes, pending_absences })
 }
 
-async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<(Vec<(String, String)>, bool)> {
+async fn converge_inner(
+    deps: &ConvergeDeps,
+    state: &mut HostState,
+    prefetch_tabs: &[String],
+) -> Result<(Vec<(String, String)>, bool)> {
     let host = &deps.host;
     let log = &deps.log;
-    let (remote_snap, local_snap) =
-        tokio::try_join!(fetch_snapshot(&deps.remote), fetch_snapshot(&deps.local))?;
+    // Overlap the (already-parallel) remote+local snapshot round-trip with the
+    // hinted layout prefetch, so a just-created pane's layout.export doesn't
+    // serialize after the snapshot. Prefetch is best-effort; the tab loop
+    // re-fetches any tab missing from `prefetched`.
+    let snap_fut = async { tokio::try_join!(fetch_snapshot(&deps.remote), fetch_snapshot(&deps.local)) };
+    let (snaps, mut prefetched) =
+        tokio::join!(snap_fut, prefetch_layouts(&deps.remote, prefetch_tabs));
+    let (remote_snap, local_snap) = snaps?;
 
     let mut local_ws_ids: HashSet<String> =
         local_snap.workspaces.iter().map(|w| w.workspace_id.clone()).collect();
@@ -795,24 +835,32 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<(V
             remote_snap.panes.iter().filter(|p| p.tab_id == rtab.tab_id).collect();
 
         if !tab_exists || remote_panes_in_tab.iter().any(|p| !state.panes.contains_key(&p.pane_id)) {
-            #[derive(Deserialize)]
-            struct Exported {
-                layout: ExportedLayout,
-            }
-            #[derive(Deserialize)]
-            struct ExportedLayout {
-                root: LayoutNode,
-            }
-            let exported: Exported =
-                deps.remote.request_t("layout.export", json!({ "tab_id": rtab.tab_id })).await?;
+            // use the concurrently-prefetched layout when the creation fast-path
+            // hinted this tab; otherwise fetch it now (the normal converge path)
+            let layout_root: LayoutNode = match prefetched.remove(&rtab.tab_id) {
+                Some(root) => root,
+                None => {
+                    #[derive(Deserialize)]
+                    struct Exported {
+                        layout: ExportedLayout,
+                    }
+                    #[derive(Deserialize)]
+                    struct ExportedLayout {
+                        root: LayoutNode,
+                    }
+                    let exported: Exported =
+                        deps.remote.request_t("layout.export", json!({ "tab_id": rtab.tab_id })).await?;
+                    exported.layout.root
+                }
+            };
             let mut remote_order = Vec::new();
-            walk_pane_ids(&exported.layout.root, &mut remote_order);
+            walk_pane_ids(&layout_root, &mut remote_order);
 
             if !tab_exists {
                 // this workspace's own proxy cwd; sync_branches plants a
                 // `.git/HEAD` here so the sidebar shows the remote branch
                 let cwd = ensure_ws_cwd(&deps.state_dir, &host.name, &rtab.workspace_id);
-                let root = map_node(&exported.layout.root, &cwd);
+                let root = map_node(&layout_root, &cwd);
                 let target_tab = ws_entry.root_tab_local_id.clone();
                 // tab_id and workspace_id are mutually exclusive on layout.apply
                 let mut params = json!({ "tab_label": rtab.label, "root": root, "focus": false });
@@ -851,7 +899,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<(V
                     let seq = state.panes.get(rid).map(|e| e.seq).unwrap_or(0);
                     state.panes.insert(
                         rid.clone(),
-                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq, reported: None },
+                        PaneEntry { local_id: local_id.clone(), tombstone: None, seq, reported: None, cwd: None },
                     );
                     // plain pane created above; exec the streamer into it
                     spawn_streamer_pane(&deps.local, &local_id, &cmd_for(rid), &deps.log).await;
@@ -872,7 +920,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<(V
                     // lives: split its nearest already-mirrored layout sibling
                     // in the tree's recorded direction. Falls back to the old
                     // first-pane/right when the layout doesn't resolve.
-                    let placed = locate_in_layout(&exported.layout.root, &rp.pane_id).and_then(
+                    let placed = locate_in_layout(&layout_root, &rp.pane_id).and_then(
                         |(dir, sibs)| {
                             sibs.iter()
                                 .find_map(|rid| state.panes.get(rid).map(|e| e.local_id.clone()))
@@ -910,7 +958,7 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<(V
                     spawn_streamer_pane(&deps.local, &split.pane.pane_id, &cmd_for(&rp.pane_id), &deps.log).await;
                     state.panes.insert(
                         rp.pane_id.clone(),
-                        PaneEntry { local_id: split.pane.pane_id, tombstone: None, seq: 0, reported: None },
+                        PaneEntry { local_id: split.pane.pane_id, tombstone: None, seq: 0, reported: None, cwd: None },
                     );
                 }
             }
@@ -925,6 +973,17 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<(V
                     .request("tab.rename", json!({ "tab_id": tab_local, "label": rtab.label }))
                     .await;
             }
+        }
+    }
+
+    // cache each mapped pane's remote cwd so the remote-split/tab/workspace
+    // actions can inherit it without a live `pane.get` round-trip. Daemon-owned:
+    // only converge writes state, the action only reads.
+    let snap_cwd: HashMap<&str, Option<String>> =
+        remote_snap.panes.iter().map(|p| (p.pane_id.as_str(), pane_snapshot_cwd(p))).collect();
+    for (rid, entry) in state.panes.iter_mut() {
+        if let Some(cwd) = snap_cwd.get(rid.as_str()) {
+            entry.cwd = cwd.clone();
         }
     }
 
@@ -1239,6 +1298,27 @@ pub async fn regroup_sidebar(local: &ApiClient, prefixes: &[String], log: &Logge
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pane(fg: Option<&str>, cwd: Option<&str>) -> PaneInfo {
+        PaneInfo {
+            pane_id: "p1".into(),
+            tab_id: "t1".into(),
+            workspace_id: "w1".into(),
+            label: None,
+            cwd: cwd.map(String::from),
+            foreground_cwd: fg.map(String::from),
+        }
+    }
+
+    #[test]
+    fn pane_snapshot_cwd_prefers_foreground() {
+        // foreground_cwd wins when both are present (the shell's live dir)
+        assert_eq!(pane_snapshot_cwd(&pane(Some("/live"), Some("/launch"))).as_deref(), Some("/live"));
+        // falls back to cwd when foreground is absent
+        assert_eq!(pane_snapshot_cwd(&pane(None, Some("/launch"))).as_deref(), Some("/launch"));
+        // none when neither is known
+        assert_eq!(pane_snapshot_cwd(&pane(None, None)), None);
+    }
 
     #[test]
     fn ws_label_two_way_rename() {

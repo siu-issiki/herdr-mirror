@@ -34,6 +34,9 @@ struct Resolved {
     host: HostConfig,
     remote_ws_id: Option<String>,
     remote_pane_id: Option<String>,
+    /// the focused remote pane's cwd as cached by the daemon's last converge,
+    /// if known — lets `run` skip a live `pane.get` round-trip
+    remote_pane_cwd: Option<String>,
 }
 
 /// find which host (if any) mirrors the workspace the action was invoked from
@@ -51,6 +54,7 @@ fn resolve_context(env: &Env, hosts: &[HostConfig], ctx: &InvocationContext) -> 
             host: host.clone(),
             remote_ws_id: Some(ws_rid.clone()),
             remote_pane_id: pane_hit.map(|(rid, _)| rid.clone()),
+            remote_pane_cwd: pane_hit.and_then(|(_, e)| e.cwd.clone()),
         });
     }
     None
@@ -84,16 +88,21 @@ pub async fn run(env: Env, kind: &str, direction: Option<&str>) -> Result<()> {
     let api = remote.connect_api_fast().await?;
 
     // cwd inheritance comes from the REMOTE side: the remote pane behind the
-    // focused mirror pane knows its real cwd; local cwds are meaningless there
-    let mut cwd: Option<String> = None;
-    if let Some(pane_id) = resolved.as_ref().and_then(|r| r.remote_pane_id.clone()) {
-        // one pane.get instead of a full snapshot — this runs on every action
-        if let Ok(res) = api.request("pane.get", json!({ "pane_id": pane_id })).await {
-            cwd = res
-                .pointer("/pane/foreground_cwd")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .or_else(|| res.pointer("/pane/cwd").and_then(|v| v.as_str()).map(String::from));
+    // focused mirror pane knows its real cwd; local cwds are meaningless there.
+    // The daemon caches that cwd into the state file on every converge, so the
+    // common path reads it locally and skips a round-trip. Only when the cache
+    // is cold (pane mapped but no cwd recorded yet) do we fall back to pane.get.
+    let mut cwd: Option<String> = resolved.as_ref().and_then(|r| r.remote_pane_cwd.clone());
+    if cwd.is_none() {
+        if let Some(pane_id) = resolved.as_ref().and_then(|r| r.remote_pane_id.clone()) {
+            // one pane.get instead of a full snapshot — cache-miss fallback only
+            if let Ok(res) = api.request("pane.get", json!({ "pane_id": pane_id })).await {
+                cwd = res
+                    .pointer("/pane/foreground_cwd")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .or_else(|| res.pointer("/pane/cwd").and_then(|v| v.as_str()).map(String::from));
+            }
         }
     }
 
@@ -138,4 +147,86 @@ pub async fn run(env: Env, kind: &str, direction: Option<&str>) -> Result<()> {
         _ => return Err(err(format!("unknown remote action: {kind}"))),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{save_state, HostState, PaneEntry, WsEntry};
+
+    fn host(name: &str) -> HostConfig {
+        HostConfig {
+            name: name.into(),
+            target: "user@host".into(),
+            prefix: "h".into(),
+            remote_bin: "herdr".into(),
+            always_control: true,
+        }
+    }
+
+    fn tmp_env() -> Env {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-mirror-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Env {
+            config_dir: dir.clone(),
+            state_dir: dir.clone(),
+            local_socket: dir.join("sock"),
+            plugin_root: dir,
+        }
+    }
+
+    /// resolve_context surfaces the daemon-cached remote cwd so `run` can skip
+    /// the live pane.get; a pane with no cached cwd yields None (cache miss →
+    /// pane.get fallback).
+    #[test]
+    fn resolve_context_reads_cached_cwd() {
+        let env = tmp_env();
+        let mut state = HostState::default();
+        state.workspaces.insert(
+            "wR".into(),
+            WsEntry { local_id: "wL".into(), tombstone: None, root_tab_local_id: None, last_remote_label: None },
+        );
+        state.panes.insert(
+            "wR:pR".into(),
+            PaneEntry {
+                local_id: "wL:pL".into(),
+                tombstone: None,
+                seq: 0,
+                reported: None,
+                cwd: Some("/remote/work/dir".into()),
+            },
+        );
+        // a second pane with no cached cwd yet
+        state.panes.insert(
+            "wR:pR2".into(),
+            PaneEntry { local_id: "wL:pL2".into(), tombstone: None, seq: 0, reported: None, cwd: None },
+        );
+        save_state(&env.state_dir, "h1", &state).unwrap();
+
+        let hosts = vec![host("h1")];
+
+        // cached cwd is returned directly
+        let ctx = InvocationContext {
+            workspace_id: Some("wL".into()),
+            focused_pane_id: Some("wL:pL".into()),
+        };
+        let r = resolve_context(&env, &hosts, &ctx).expect("resolves");
+        assert_eq!(r.remote_pane_id.as_deref(), Some("wR:pR"));
+        assert_eq!(r.remote_pane_cwd.as_deref(), Some("/remote/work/dir"));
+
+        // pane without a cached cwd → None (falls back to pane.get in run)
+        let ctx2 = InvocationContext {
+            workspace_id: Some("wL".into()),
+            focused_pane_id: Some("wL:pL2".into()),
+        };
+        let r2 = resolve_context(&env, &hosts, &ctx2).expect("resolves");
+        assert_eq!(r2.remote_pane_id.as_deref(), Some("wR:pR2"));
+        assert_eq!(r2.remote_pane_cwd, None);
+
+        std::fs::remove_dir_all(&env.state_dir).ok();
+    }
 }
