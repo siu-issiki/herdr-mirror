@@ -56,8 +56,6 @@ pub struct Args {
     pub session: Option<String>,
     /// auto-release control after this much input idle; 0 disables
     pub control_idle_secs: u64,
-    /// --cols/--rows are the remote pane's real size (plus margin), use as-is
-    pub size_fixed: bool,
     /// start and stay in control: writable, no idle release, and sized to the
     /// local pane so it fills. Set by the daemon from per-host config.
     pub always_control: bool,
@@ -76,7 +74,6 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         dump: false,
         session: None,
         control_idle_secs: 3600,
-        size_fixed: false,
         always_control: false,
         ctl_path: None,
     };
@@ -90,11 +87,9 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
             "--remote-bin" => args.remote_bin = next("--remote-bin")?,
             "--cols" => {
                 args.cols = next("--cols")?.parse().map_err(|_| err("--cols must be a number"))?;
-                args.size_fixed = true;
             }
             "--rows" => {
                 args.rows = next("--rows")?.parse().map_err(|_| err("--rows must be a number"))?;
-                args.size_fixed = true;
             }
             "--session" => args.session = Some(next("--session")?),
             "--control-idle" => {
@@ -352,6 +347,10 @@ fn has_mouse_seq(bytes: &[u8]) -> bool {
 const BACKOFF: [u64; 4] = [1000, 2000, 5000, 10000];
 const SWITCH_GAP: Duration = Duration::from_millis(200);
 const QUICK_CONTROL_FAILURE: Duration = Duration::from_secs(4);
+/// always-control: how often to retry control while stuck observing after a
+/// fallback. Slow enough that a repeatedly-refused control session can't spin
+/// (each retry still needs 2 quick failures to fall back again).
+const CONTROL_RETRY_INTERVAL: Duration = Duration::from_secs(20);
 
 struct App {
     args: Args,
@@ -372,6 +371,11 @@ struct App {
     /// consecutive quick control failures → fall back to observe
     control_failures: u32,
     control_sticky: bool,
+    /// always-control only: fell back to observe and waiting to retry control
+    /// without needing a keystroke. Cleared as soon as a control switch is
+    /// (re-)attempted; re-armed by `handle_exit`'s fallback if that attempt
+    /// also fails quickly.
+    control_retry_at: Option<Instant>,
     pending_input: Vec<Vec<u8>>,
     last_input: Instant,
     hint_clear_at: Option<Instant>,
@@ -494,10 +498,8 @@ impl App {
 
     fn observe_size(&self) -> (usize, usize) {
         // must request >= the remote PTY size or the server clips its bottom
-        // rows; daemon-passed sizes already include a margin
-        if self.args.size_fixed {
-            return (self.args.cols, self.args.rows);
-        }
+        // rows; take the larger of the daemon-passed size (remote size + margin
+        // at spawn time — it can grow stale) and the live local terminal size
         let (c, r) = if self.tty { term_size() } else { (0, 0) };
         (self.args.cols.max(c), self.args.rows.max(r))
     }
@@ -574,6 +576,11 @@ impl App {
             return;
         }
         self.reconnect_at = None;
+        if m == Mode::Control {
+            // an attempt is in flight either way; a renewed failure re-arms
+            // this from handle_exit's fallback
+            self.control_retry_at = None;
+        }
         self.switching_to = Some(m);
         self.stop_session();
         self.renderer.invalidate();
@@ -639,12 +646,25 @@ impl App {
                 self.control_failures = 0;
                 self.control_sticky = true;
                 self.switch_mode(Mode::Observe);
+                // always-control has no one to type and retry, so retry itself
+                // on a timer instead of waiting indefinitely in observe
+                if self.args.always_control {
+                    self.control_retry_at = Some(Instant::now() + CONTROL_RETRY_INTERVAL);
+                }
                 let suffix = if reason_line.is_empty() { String::new() } else { format!(" ({reason_line})") };
                 self.hint(&format!("control unavailable — viewing only{suffix}; type to retry"));
                 return;
             }
         }
         self.schedule_reconnect(exited_mode, &reason_line);
+    }
+
+    /// Escalate observe → control: the path a keystroke takes, also reused by
+    /// the always-control timed retry (`control_retry_at`) so a pane stuck
+    /// observing after a network blip recovers without input.
+    fn retry_control(&mut self) {
+        self.control_sticky = false;
+        self.switch_mode(Mode::Control);
     }
 
     async fn send(&mut self, msg: serde_json::Value) {
@@ -671,9 +691,8 @@ impl App {
                 return;
             }
             // any keystroke takes control and is delivered once the session is up
-            self.control_sticky = false;
             self.pending_input.push(buf);
-            self.switch_mode(Mode::Control);
+            self.retry_control();
             return;
         }
 
@@ -883,6 +902,7 @@ pub async fn run(args: Args) -> Result<()> {
         reconnect_at: None,
         control_failures: 0,
         control_sticky: false,
+        control_retry_at: None,
         pending_input: Vec::new(),
         last_input: Instant::now(),
         hint_clear_at: None,
@@ -916,6 +936,7 @@ pub async fn run(args: Args) -> Result<()> {
             idle_at,
             app.predict.deadline(),
             app.settle_at,
+            app.control_retry_at,
         ]);
 
         tokio::select! {
@@ -983,6 +1004,14 @@ pub async fn run(args: Args) -> Result<()> {
                     app.predict.on_tick(); // wipe timed-out ghosts (no-echo prompts)
                     app.paint();
                 }
+                // always-control stuck in observe after a fallback: retry control
+                // on our own rather than waiting forever for a keystroke
+                if app.control_retry_at.is_some_and(|t| t <= now) {
+                    app.control_retry_at = None;
+                    if app.mode == Mode::Observe && app.switching_to.is_none() {
+                        app.retry_control();
+                    }
+                }
             }
         }
     }
@@ -1042,7 +1071,6 @@ mod tests {
         assert_eq!(a.pane_target, "w9:p1");
         assert_eq!(a.remote_bin, "/opt/herdr");
         assert_eq!((a.cols, a.rows), (176, 66));
-        assert!(a.size_fixed);
         assert!(parse_args(&["onlyone".to_string()]).is_err());
         assert!(parse_args(&["a".into(), "b".into(), "--visibility-file".into(), "x".into()]).is_err());
     }
