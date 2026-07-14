@@ -170,16 +170,23 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         .as_ref()
         .map(|s| format!(" --session {}", sh_quote(s)))
         .unwrap_or_default();
+    // always-control: this mirror is the pane's one intended client, so force
+    // the takeover to evict any ghost attach a network drop left holding the
+    // lock (otherwise every control reconnect is refused with "already has an
+    // attached client" until someone manually intervenes). Never on observe —
+    // a read-only session has no business stealing the attach.
+    let takeover = if mode == Mode::Control && args.always_control { " --takeover" } else { "" };
     // remote_bin stays unquoted on purpose: the default ~/.local/bin/herdr
     // relies on remote-shell tilde expansion
     let cmd = format!(
-        "exec {}{} terminal session {} {} --cols {} --rows {}",
+        "exec {}{} terminal session {} {} --cols {} --rows {}{}",
         args.remote_bin,
         session_flag,
         mode.as_str(),
         sh_quote(&args.pane_target),
         cols,
-        rows
+        rows,
+        takeover
     );
     let mut sc = tokio::process::Command::new("ssh");
     // reuse the daemon's ControlMaster when it's alive; a missing socket
@@ -598,6 +605,17 @@ impl App {
             let suffix = frame.reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default();
             self.renderer.status(&format!("remote terminal closed{suffix}"));
             self.paint();
+            // Observed in the wild: the remote CLI emits terminal.closed (e.g.
+            // an attach failure — "already has an attached client; retry with
+            // --takeover") but does not exit on its own, so retries pile up
+            // ssh/remote-CLI processes on both ends. Kill our side directly by
+            // pid — don't touch `self.session`/mode here, so the child's real
+            // exit still arrives as a normal SessionExit with a matching gen
+            // and handle_exit's backoff / control-failure bookkeeping runs
+            // exactly as it would for any other exit (no double state change).
+            if let Some(s) = self.session.as_ref() {
+                unsafe { libc::kill(s.pid, libc::SIGTERM) };
+            }
             return;
         }
         if frame.kind != "terminal.frame" {
