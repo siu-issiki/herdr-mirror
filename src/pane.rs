@@ -631,6 +631,32 @@ struct App {
     /// mux transport: monotonic counter for foreground-poll api sids (offset by
     /// `MUX_API_SID_BASE` so they stay clear of session gens).
     mux_api_sid: u64,
+    /// set by `handle_frame` when a `terminal.closed` reason indicates the
+    /// remote pane's process itself exited (see `closed_reason_is_pane_exit`).
+    /// Checked by the main loop right after dispatching a frame so it can
+    /// `break` into the existing clean-shutdown path instead of reconnecting.
+    exit_requested: bool,
+}
+
+/// A terminal.closed reason of the form "terminal <id> exited" means the
+/// remote pane's process ended (ctrl+d etc.) — the pane is gone for good,
+/// not a transient attach/server condition (attach conflicts, takeover
+/// refusals, and server restarts all use different reason text). Requires a
+/// non-empty id between the fixed prefix/suffix rather than a plain
+/// starts_with/ends_with check: for a short reason like "terminal exited"
+/// those two patterns overlap (9-char prefix + 7-char suffix > 15-char
+/// string), which would misclassify an id-less reason as a pane exit. A real
+/// reason always carries a non-empty `term_xxx` id, so treating the
+/// id-less form conservatively as "not a pane exit" costs nothing in
+/// practice while avoiding that false positive.
+fn closed_reason_is_pane_exit(reason: Option<&str>) -> bool {
+    let Some(rest) = reason.and_then(|r| r.strip_prefix("terminal ")) else {
+        return false;
+    };
+    match rest.strip_suffix(" exited") {
+        Some(id) => !id.is_empty(),
+        None => false,
+    }
 }
 
 /// minimum spacing between foreground polls — each is an ssh handshake, so we
@@ -894,6 +920,18 @@ impl App {
             let suffix = frame.reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default();
             self.renderer.status(&format!("remote terminal closed{suffix}"));
             self.paint();
+            if closed_reason_is_pane_exit(frame.reason.as_deref()) {
+                // The remote pane's process itself ended — this pane is gone
+                // for good, not a transient attach/server condition. Skip the
+                // reconnect/backoff dance entirely: flag the main loop to
+                // break so the existing clean-shutdown path (release control
+                // if held, terminate the session through the same Ssh-kill /
+                // Mux-close machinery, restore the tty) runs immediately and
+                // herdr closes the local pane right away instead of waiting
+                // out a backoff-driven reconnect.
+                self.exit_requested = true;
+                return;
+            }
             // Observed in the wild: the remote CLI emits terminal.closed (e.g.
             // an attach failure — "already has an attached client; retry with
             // --takeover") but does not exit on its own, so retries pile up
@@ -1240,6 +1278,7 @@ pub async fn run(args: Args) -> Result<()> {
         mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
         mux_tx: None,
         mux_api_sid: 0,
+        exit_requested: false,
     };
 
     // optimistic-split pending mode: the remote pane doesn't exist yet. Show a
@@ -1301,7 +1340,12 @@ pub async fn run(args: Args) -> Result<()> {
             msg = rx.recv() => {
                 match msg {
                     None => break,
-                    Some(Msg::Frame { gen, frame }) => app.handle_frame(gen, frame),
+                    Some(Msg::Frame { gen, frame }) => {
+                        app.handle_frame(gen, frame);
+                        if app.exit_requested {
+                            break;
+                        }
+                    }
                     Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
                     Some(Msg::MuxExit { sid, code }) => {
                         // rebuild a SessionExit from the current session state; the
@@ -1417,6 +1461,24 @@ pub async fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_reason_pane_exit_classification() {
+        // real shape: "terminal <id> exited" — the remote process ended
+        assert!(closed_reason_is_pane_exit(Some("terminal term_abc exited")));
+        // attach conflicts / takeover refusals are a different reason shape
+        assert!(!closed_reason_is_pane_exit(Some(
+            "terminal attach failed: already has an attached client; retry with --takeover"
+        )));
+        // no reason at all (e.g. a malformed/absent field) is never a pane exit
+        assert!(!closed_reason_is_pane_exit(None));
+        // boundary: prefix "terminal " (9 chars) and suffix " exited" (7 chars)
+        // overlap on a 15-char string with no id in between. A naive
+        // starts_with/ends_with check would misclassify this as a pane exit;
+        // we require a non-empty id, so it's treated as *not* a pane exit —
+        // real reasons always carry a non-empty term_xxx id.
+        assert!(!closed_reason_is_pane_exit(Some("terminal exited")));
+    }
 
     #[test]
     fn mouse_parsing() {
