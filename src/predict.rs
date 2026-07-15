@@ -30,6 +30,20 @@ struct Pending {
     at: Instant,
 }
 
+/// Escape-sequence parse state, carried across `on_input` calls so a
+/// sequence split across separate reads (e.g. `\x1b` then `[A` in two
+/// chunks) is still recognized and never partially echoed.
+#[derive(Default, PartialEq, Eq, Clone, Copy)]
+enum EscState {
+    #[default]
+    Normal,
+    Esc,
+    Csi,
+    Ss3,
+    Osc,
+    OscEsc,
+}
+
 #[derive(Default)]
 pub struct Predictor {
     pending: Vec<Pending>,
@@ -38,6 +52,9 @@ pub struct Predictor {
     /// a prediction was cleared without a frame repainting it — the renderer
     /// must invalidate so ghost characters get wiped
     dirty: bool,
+    /// escape-sequence parser state; bytes consumed while not `Normal` are
+    /// never treated as printable echo candidates
+    esc_state: EscState,
 }
 
 // debug tracing (temporary): HERDR_MIRROR_PREDICT_LOG=1 or presence of the
@@ -70,42 +87,95 @@ impl Predictor {
     pub fn on_input(&mut self, bytes: &[u8], grid: &Grid) -> bool {
         let mut changed = false;
         for &b in bytes {
-            match b {
-                0x20..=0x7e => {
-                    if self.pending.len() >= MAX_PENDING {
-                        continue;
+            match self.esc_state {
+                EscState::Normal => match b {
+                    0x1b => {
+                        // start of an escape sequence: the line's fate is
+                        // unknowable locally until it resolves — drop
+                        // optimism now, same as any other control char.
+                        self.esc_state = EscState::Esc;
+                        if !self.pending.is_empty() {
+                            self.dirty = true;
+                            changed = true;
+                            self.pending.clear();
+                        }
                     }
-                    let (row, col) = match self.pending.last() {
-                        Some(p) => (p.row, p.col + 1),
-                        None => (grid.cursor_row, grid.cursor_col),
-                    };
-                    if row >= grid.height || col >= grid.width {
+                    0x20..=0x7e => {
+                        if self.pending.len() >= MAX_PENDING {
+                            continue;
+                        }
+                        let (row, col) = match self.pending.last() {
+                            Some(p) => (p.row, p.col + 1),
+                            None => (grid.cursor_row, grid.cursor_col),
+                        };
+                        if row >= grid.height || col >= grid.width {
+                            dbg(&format!(
+                                "skip '{}' off-grid: pos=({row},{col}) grid={}x{} cursor=({},{})",
+                                b as char, grid.width, grid.height, grid.cursor_row, grid.cursor_col
+                            ));
+                            continue; // off-grid (or pre-first-frame): don't predict
+                        }
                         dbg(&format!(
-                            "skip '{}' off-grid: pos=({row},{col}) grid={}x{} cursor=({},{})",
-                            b as char, grid.width, grid.height, grid.cursor_row, grid.cursor_col
+                            "push '{}' at ({row},{col}) streak={}",
+                            b as char, self.streak
                         ));
-                        continue; // off-grid (or pre-first-frame): don't predict
-                    }
-                    dbg(&format!("push '{}' at ({row},{col}) streak={}", b as char, self.streak));
-                    self.pending.push(Pending { row, col, ch: b as char, at: Instant::now() });
-                    changed = true;
-                }
-                0x7f | 0x08 => {
-                    // backspace only cancels our own optimism; erasing real
-                    // remote content is the frame's job
-                    if self.pending.pop().is_some() {
-                        self.dirty = true;
+                        self.pending.push(Pending {
+                            row,
+                            col,
+                            ch: b as char,
+                            at: Instant::now(),
+                        });
                         changed = true;
                     }
-                }
-                _ => {
-                    // enter / escape sequences / control chars: the line's
-                    // fate is unknowable locally — drop optimism, frames drive
-                    if !self.pending.is_empty() {
-                        self.dirty = true;
-                        changed = true;
-                        self.pending.clear();
+                    0x7f | 0x08 => {
+                        // backspace only cancels our own optimism; erasing
+                        // real remote content is the frame's job
+                        if self.pending.pop().is_some() {
+                            self.dirty = true;
+                            changed = true;
+                        }
                     }
+                    _ => {
+                        // enter / other control chars: the line's fate is
+                        // unknowable locally — drop optimism, frames drive
+                        if !self.pending.is_empty() {
+                            self.dirty = true;
+                            changed = true;
+                            self.pending.clear();
+                        }
+                    }
+                },
+                EscState::Esc => {
+                    // second byte of the sequence: never echoed
+                    self.esc_state = match b {
+                        b'[' => EscState::Csi,
+                        b'O' => EscState::Ss3,
+                        b']' => EscState::Osc,
+                        _ => EscState::Normal, // 2-byte escape (e.g. ESC c)
+                    };
+                }
+                EscState::Csi => match b {
+                    0x40..=0x7e => self.esc_state = EscState::Normal, // final byte
+                    0x20..=0x3f => {} // parameter/intermediate bytes: stay in Csi
+                    _ => self.esc_state = EscState::Normal, // malformed: bail out
+                },
+                EscState::Ss3 => {
+                    // SS3 sequences are always ESC O + exactly one byte
+                    self.esc_state = EscState::Normal;
+                }
+                EscState::Osc => {
+                    self.esc_state = match b {
+                        0x07 => EscState::Normal, // BEL terminator
+                        0x1b => EscState::OscEsc, // possible ST (ESC \)
+                        _ => EscState::Osc,
+                    };
+                }
+                EscState::OscEsc => {
+                    self.esc_state = if b == b'\\' {
+                        EscState::Normal // ST terminator
+                    } else {
+                        EscState::Osc // not ST after all: back into the string
+                    };
                 }
             }
         }
@@ -274,5 +344,59 @@ mod tests {
         assert!(p.pending.is_empty());
         assert_eq!(p.streak, 0);
         assert!(p.take_dirty()); // forces repaint that erases the ghosts
+    }
+
+    #[test]
+    fn csi_arrow_key_not_echoed() {
+        let mut p = Predictor::new();
+        let g = grid_at("$ ", 2);
+        p.on_input(b"\x1b[A", &g);
+        assert!(p.pending.is_empty());
+        assert!(p.overlay(&g, 20, 2).is_empty());
+    }
+
+    #[test]
+    fn csi_arrow_key_split_across_chunks_not_echoed() {
+        let mut p = Predictor::new();
+        let g = grid_at("$ ", 2);
+        p.on_input(b"\x1b", &g);
+        p.on_input(b"[A", &g);
+        assert!(p.pending.is_empty());
+        assert!(p.overlay(&g, 20, 2).is_empty());
+    }
+
+    #[test]
+    fn sgr_mouse_sequence_not_echoed() {
+        let mut p = Predictor::new();
+        let g = grid_at("$ ", 2);
+        p.on_input(b"\x1b[<35;80;24M", &g);
+        assert!(p.pending.is_empty());
+        assert!(p.overlay(&g, 20, 2).is_empty());
+    }
+
+    #[test]
+    fn ss3_arrow_key_not_echoed() {
+        let mut p = Predictor::new();
+        let g = grid_at("$ ", 2);
+        p.on_input(b"\x1bOA", &g);
+        assert!(p.pending.is_empty());
+        assert!(p.overlay(&g, 20, 2).is_empty());
+    }
+
+    #[test]
+    fn plain_text_still_echoes() {
+        let mut p = Predictor::new();
+        let g = grid_at("$ ", 2);
+        p.on_input(b"abc", &g);
+        assert_eq!(p.pending.len(), 3);
+    }
+
+    #[test]
+    fn osc_sequence_ignored_trailing_text_echoed() {
+        let mut p = Predictor::new();
+        let g = grid_at("$ ", 2);
+        p.on_input(b"\x1b]0;title\x07x", &g);
+        assert_eq!(p.pending.len(), 1);
+        assert_eq!(p.pending[0].ch, 'x');
     }
 }
