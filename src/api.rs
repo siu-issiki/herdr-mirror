@@ -36,6 +36,12 @@ pub struct ApiClient {
 }
 
 impl ApiClient {
+    /// Bind a client to a socket path without probing it. Each request/subscribe
+    /// opens its own connection, so no liveness is implied here.
+    pub fn at(socket_path: &Path) -> ApiClient {
+        ApiClient { socket_path: socket_path.to_path_buf() }
+    }
+
     /// Connect-check the socket (one ping round-trip), then hand back a client.
     pub async fn connect(socket_path: &Path) -> Result<ApiClient> {
         let client = ApiClient { socket_path: socket_path.to_path_buf() };

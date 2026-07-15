@@ -6,6 +6,7 @@
 //   herdr-mirror start|pause|ensure|status|once|restore|teardown
 //   herdr-mirror remote-workspace|remote-tab|remote-split <right|down>
 
+mod agent;
 mod api;
 mod config;
 mod daemon;
@@ -14,6 +15,7 @@ mod grid;
 mod mirror;
 mod pane;
 mod predict;
+mod protocol;
 mod remote;
 mod remote_action;
 mod state;
@@ -75,6 +77,10 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             let args = pane::parse_args(&rest[1..])?;
             rt.block_on(pane::run(args))
         }
+        "agent" => {
+            let args = agent::parse_args(&rest[1..])?;
+            rt.block_on(agent::run(args))
+        }
         "remote-workspace" => rt.block_on(remote_action::run(Env::resolve()?, "workspace", None)),
         "remote-tab" => rt.block_on(remote_action::run(Env::resolve()?, "tab", None)),
         "remote-split" => rt.block_on(remote_action::run(
@@ -83,7 +89,7 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             rest.get(1).map(String::as_str),
         )),
         other => Err(util::err(format!(
-            "unknown command: {other} (daemon|pane|start|pause|ensure|status|once|restore|teardown|remote-workspace|remote-tab|remote-split)"
+            "unknown command: {other} (daemon|pane|agent|start|pause|ensure|status|once|restore|teardown|remote-workspace|remote-tab|remote-split)"
         ))),
     }
 }
