@@ -32,15 +32,18 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::UnixStream;
 use tokio::process::ChildStdin;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::util::{err, Result};
 use crate::foreground::Foreground;
 use crate::grid::{normalize_selection, window_offset, Grid, Renderer};
 use crate::predict::Predictor;
+use crate::protocol;
+use crate::util::{err, Result};
 
 // ---------------------------------------------------------------------------
 // args
@@ -62,6 +65,12 @@ pub struct Args {
     /// daemon's ssh ControlMaster socket for this host; foreground polls reuse it
     /// (`ssh -S <path>`) to skip a handshake. None → polls connect directly.
     pub ctl_path: Option<String>,
+    /// host's single mux socket (`<state_dir>/<host>-mux.sock`). When set, the
+    /// wrapper opens sessions / sends input / polls the foreground over this one
+    /// unix connection instead of spawning an ssh child per stream. If the socket
+    /// can't be reached (mux not up yet) it falls back to the ssh path below, and
+    /// retries the mux on the next (re)connect. None → ssh transport only.
+    pub mux_sock: Option<String>,
 }
 
 pub fn parse_args(argv: &[String]) -> Result<Args> {
@@ -76,6 +85,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         control_idle_secs: 3600,
         always_control: false,
         ctl_path: None,
+        mux_sock: None,
     };
     let mut positional: Vec<String> = Vec::new();
     let mut it = argv.iter();
@@ -98,6 +108,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
             }
             "--always-control" => args.always_control = true,
             "--ctl-path" => args.ctl_path = Some(next("--ctl-path")?),
+            "--mux-sock" => args.mux_sock = Some(next("--mux-sock")?),
             "--dump" => args.dump = true,
             other if other.starts_with('-') => return Err(err(format!("unknown option: {other}"))),
             other => positional.push(other.to_string()),
@@ -150,13 +161,63 @@ enum Msg {
     /// result of a background foreground-process poll: `Some(_)` = classified
     /// (shell/agent/TUI), `None` = poll failed (keep last value)
     Foreground(Option<Foreground>),
+    /// mux transport: an agent terminal child exited (`exit` op). sid == gen.
+    MuxExit { sid: u64, code: i32 },
+    /// mux transport: the mux is re-opening the agent link (`{"op":"closed",…}`).
+    /// Status-only blip — the session is kept; a full frame follows on recovery.
+    MuxReconnecting,
+    /// mux transport: the wrapper→mux socket hit EOF (mux/daemon gone). Treated
+    /// as the current session exiting so the normal reconnect flow re-establishes.
+    MuxClosed,
+}
+
+/// How a session reaches the remote terminal child: either a dedicated ssh child
+/// (legacy, per-stream) or the shared single mux connection.
+enum Transport {
+    /// legacy: an ssh child; input goes to its stdin, teardown SIGTERMs its pid.
+    Ssh { pid: i32, stdin: ChildStdin },
+    /// mux: input is wrapped as an `input` op and teardown sends `close`, both on
+    /// the shared write channel. `sid` (== the session's gen) tags every line.
+    Mux { sid: u64, tx: mpsc::UnboundedSender<String> },
 }
 
 struct Session {
     gen: u64,
     mode: Mode,
-    pid: i32,
-    stdin: ChildStdin,
+    /// when this session was opened — used to compute the exit uptime for mux
+    /// sessions (the ssh reader computes its own). Drives control-failure backoff.
+    started: Instant,
+    transport: Transport,
+}
+
+impl Session {
+    /// Send a raw child-stdin JSON line (a trailing newline is optional; the mux
+    /// path strips it since the agent re-appends one).
+    async fn send_input(&mut self, line: &str) {
+        match &mut self.transport {
+            Transport::Ssh { stdin, .. } => {
+                let _ = stdin.write_all(line.as_bytes()).await;
+            }
+            Transport::Mux { sid, tx } => {
+                let d = line.strip_suffix('\n').unwrap_or(line).to_string();
+                let _ = tx.send(protocol::Msg::Input { sid: *sid, d }.to_line());
+            }
+        }
+    }
+
+    /// Tear the session down without a graceful release (caller does that first
+    /// when needed): SIGTERM the ssh child, or send `close` so the agent reaps
+    /// its child.
+    fn terminate(&self) {
+        match &self.transport {
+            Transport::Ssh { pid, .. } => unsafe {
+                libc::kill(*pid, libc::SIGTERM);
+            },
+            Transport::Mux { sid, tx } => {
+                let _ = tx.send(protocol::Msg::Close { sid: *sid }.to_line());
+            }
+        }
+    }
 }
 
 /// POSIX single-quote: an embedded ' can't break the remote shell parse.
@@ -245,7 +306,102 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         let _ = tx.send(Msg::SessionExit { gen, mode, reason, uptime: started.elapsed() }).await;
     });
 
-    Ok(Session { gen, mode, pid, stdin })
+    Ok(Session { gen, mode, started, transport: Transport::Ssh { pid, stdin } })
+}
+
+// ---------------------------------------------------------------------------
+// mux transport: one shared unix connection to the host's mux, replacing the
+// per-stream ssh child. `open`/`input`/`close`/`api` go out on the write channel;
+// `l`/`exit`/`api_res`/reconnect blips come back through the reader below.
+
+/// api sids for foreground polls live above every plausible session gen so they
+/// never collide (routing tolerates a collision anyway — terminals never emit
+/// `api_res`, api polls never emit `l`/`exit` — but a disjoint range is tidier).
+const MUX_API_SID_BASE: u64 = 1 << 40;
+
+/// A parsed mux line as a wrapper-internal event. Pure (no I/O) so the L→Frame,
+/// exit, and reconnect-blip mapping can be unit-tested; the reader task turns
+/// these into channel messages.
+#[derive(Debug)]
+enum MuxEvent {
+    /// terminal frame for this sid (== the session gen).
+    Frame(u64, Frame),
+    /// terminal child exited with this code.
+    Exit(u64, i32),
+    /// foreground `api_res`, already classified (`None` = indeterminate).
+    Foreground(Option<Foreground>),
+    /// `{"op":"closed",…}` — the mux is re-opening the agent link (status blip).
+    Reconnecting,
+    /// nothing actionable (ping / hello / unknown / malformed).
+    Ignore,
+}
+
+/// Classify a foreground `api_res` result. The agent hands back the bare
+/// `result` value, but `foreground::classify` expects the `{"result":{…}}`
+/// envelope, so re-wrap before handing it over.
+fn classify_result(result: Option<serde_json::Value>) -> Option<Foreground> {
+    let result = result?;
+    crate::foreground::classify(&json!({ "result": result }).to_string())
+}
+
+/// True for the mux's reconnect notice, the one raw line `parse_line` rejects
+/// (there is no `closed` op) that the wrapper still acts on.
+fn is_mux_reconnecting(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line.trim())
+        .ok()
+        .and_then(|v| v.get("op").and_then(|o| o.as_str()).map(|s| s == "closed"))
+        .unwrap_or(false)
+}
+
+/// Pure mux-line → event mapping (see `MuxEvent`).
+fn mux_line_to_event(line: &str) -> MuxEvent {
+    if let Some(msg) = protocol::parse_line(line) {
+        match msg {
+            protocol::Msg::Line { sid, d } => match serde_json::from_str::<Frame>(&d) {
+                Ok(frame) => MuxEvent::Frame(sid, frame),
+                Err(_) => MuxEvent::Ignore,
+            },
+            protocol::Msg::Exit { sid, code } => MuxEvent::Exit(sid, code),
+            protocol::Msg::ApiRes { result, .. } => MuxEvent::Foreground(classify_result(result)),
+            _ => MuxEvent::Ignore,
+        }
+    } else if is_mux_reconnecting(line) {
+        MuxEvent::Reconnecting
+    } else {
+        MuxEvent::Ignore
+    }
+}
+
+/// Reader task for the shared mux connection: demuxes agent lines onto the App
+/// channel. Terminal `l`/`exit` carry the sid (== gen), so `handle_frame`/
+/// `handle_exit`'s existing gen check drops any stale line from a replaced
+/// session. On EOF it emits `MuxClosed` so the App re-establishes the link.
+async fn mux_reader_task(rd: OwnedReadHalf, tx: mpsc::Sender<Msg>) {
+    let mut lines = BufReader::new(rd).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let msg = match mux_line_to_event(&line) {
+            MuxEvent::Frame(sid, frame) => Msg::Frame { gen: sid, frame },
+            MuxEvent::Exit(sid, code) => Msg::MuxExit { sid, code },
+            MuxEvent::Foreground(fg) => Msg::Foreground(fg),
+            MuxEvent::Reconnecting => Msg::MuxReconnecting,
+            MuxEvent::Ignore => continue,
+        };
+        if tx.send(msg).await.is_err() {
+            return;
+        }
+    }
+    let _ = tx.send(Msg::MuxClosed).await;
+}
+
+/// Writer task for the shared mux connection: drains the write channel to the
+/// socket. Exits on write error, dropping the channel so senders see it closed.
+async fn mux_writer_task(mut wr: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<String>) {
+    while let Some(line) = rx.recv().await {
+        if wr.write_all(line.as_bytes()).await.is_err() {
+            break;
+        }
+        let _ = wr.flush().await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +564,13 @@ struct App {
     /// so herdr does native selection/scroll; re-grabbed for a TUI so clicks can
     /// be forwarded.
     mouse_grabbed: bool,
+    /// mux transport: write channel to the shared mux connection. `Some` once the
+    /// connection is up; `None` before the first connect or after the socket
+    /// dropped (re-established lazily by `ensure_mux`). Ignored in ssh mode.
+    mux_tx: Option<mpsc::UnboundedSender<String>>,
+    /// mux transport: monotonic counter for foreground-poll api sids (offset by
+    /// `MUX_API_SID_BASE` so they stay clear of session gens).
+    mux_api_sid: u64,
 }
 
 /// minimum spacing between foreground polls — each is an ssh handshake, so we
@@ -457,6 +620,18 @@ impl App {
             return;
         }
         self.fg_poll_at = Some(now);
+        // mux transport: request over the shared connection; the reader delivers
+        // the `api_res` as Msg::Foreground. No per-poll ssh handshake.
+        if let Some(tx) = self.mux_tx.clone() {
+            self.mux_api_sid += 1;
+            let msg = protocol::Msg::Api {
+                sid: MUX_API_SID_BASE + self.mux_api_sid,
+                method: "pane.process_info".into(),
+                params: json!({ "pane_id": self.args.pane_target }),
+            };
+            let _ = tx.send(msg.to_line());
+            return;
+        }
         let tx = self.tx.clone();
         let ssh = self.args.ssh_target.clone();
         let bin = self.args.remote_bin.clone();
@@ -517,12 +692,58 @@ impl App {
         if let Some(mut s) = self.session.take() {
             tokio::spawn(async move {
                 if s.mode == Mode::Control {
-                    let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
+                    s.send_input("{\"type\":\"terminal.release\"}\n").await;
                 }
                 tokio::time::sleep(Duration::from_millis(150)).await;
-                unsafe { libc::kill(s.pid, libc::SIGTERM) };
+                s.terminate();
             });
         }
+    }
+
+    /// Ensure the shared mux connection is up, spawning its reader/writer tasks
+    /// on a fresh connect. Returns false if the socket can't be reached (mux not
+    /// up yet) so the caller falls back to the ssh transport. Only meaningful
+    /// when `--mux-sock` was given.
+    async fn ensure_mux(&mut self) -> bool {
+        if let Some(tx) = &self.mux_tx {
+            if !tx.is_closed() {
+                return true;
+            }
+        }
+        self.mux_tx = None;
+        let Some(sock) = self.args.mux_sock.clone() else { return false };
+        match UnixStream::connect(&sock).await {
+            Ok(stream) => {
+                let (rd, wr) = stream.into_split();
+                let (wtx, wrx) = mpsc::unbounded_channel::<String>();
+                tokio::spawn(mux_writer_task(wr, wrx));
+                tokio::spawn(mux_reader_task(rd, self.tx.clone()));
+                self.mux_tx = Some(wtx);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Open a terminal session over the shared mux connection (the mux analog of
+    /// `spawn_session`). The client sid is the session gen, so replies route by
+    /// the existing gen check and no stale sid can bleed across generations.
+    fn open_mux_session(&self, m: Mode, cols: usize, rows: usize, gen: u64) -> Result<Session> {
+        let tx = self.mux_tx.clone().ok_or_else(|| err("mux not connected"))?;
+        // same takeover policy as the ssh path: only always-control evicts a
+        // ghost attach, and never on observe.
+        let takeover = m == Mode::Control && self.args.always_control;
+        let open = protocol::Msg::Open {
+            sid: gen,
+            pane: self.args.pane_target.clone(),
+            mode: m.as_str().to_string(),
+            cols: cols as u32,
+            rows: rows as u32,
+            takeover,
+            session: self.args.session.clone(),
+        };
+        tx.send(open.to_line()).map_err(|_| err("mux write channel closed"))?;
+        Ok(Session { gen, mode: m, started: Instant::now(), transport: Transport::Mux { sid: gen, tx } })
     }
 
     async fn connect(&mut self, m: Mode) {
@@ -534,17 +755,25 @@ impl App {
             Mode::Control => term_size(),
         };
         if let Some(s) = self.session.take() {
-            unsafe { libc::kill(s.pid, libc::SIGTERM) };
+            s.terminate();
         }
         self.next_gen += 1;
-        match spawn_session(&self.args, m, cols, rows, self.next_gen, self.tx.clone()) {
+        let gen = self.next_gen;
+        // prefer the mux transport; fall back to the ssh child if the socket
+        // isn't reachable yet (mux still starting) — retried on the next connect.
+        let spawned = if self.args.mux_sock.is_some() && self.ensure_mux().await {
+            self.open_mux_session(m, cols, rows, gen)
+        } else {
+            spawn_session(&self.args, m, cols, rows, gen, self.tx.clone())
+        };
+        match spawned {
             Ok(mut s) => {
                 if m == Mode::Control {
                     self.last_input = Instant::now();
                     // keystrokes typed while the control session was spinning up
                     for buf in std::mem::take(&mut self.pending_input) {
                         let line = json!({ "type": "terminal.input", "bytes": B64.encode(&buf) }).to_string() + "\n";
-                        let _ = s.stdin.write_all(line.as_bytes()).await;
+                        s.send_input(&line).await;
                     }
                 } else {
                     self.pending_input.clear();
@@ -614,7 +843,25 @@ impl App {
             // and handle_exit's backoff / control-failure bookkeeping runs
             // exactly as it would for any other exit (no double state change).
             if let Some(s) = self.session.as_ref() {
-                unsafe { libc::kill(s.pid, libc::SIGTERM) };
+                match &s.transport {
+                    Transport::Ssh { pid, .. } => unsafe {
+                        libc::kill(*pid, libc::SIGTERM);
+                    },
+                    Transport::Mux { .. } => {
+                        // mux owns the child: `close` makes the agent reap it.
+                        // But the mux drops the sid on close, so the agent's
+                        // `exit` won't route back — synthesize the SessionExit
+                        // here so reconnect / control-failure bookkeeping runs
+                        // exactly as the ssh kill→exit path would.
+                        s.terminate();
+                        let (gen, mode, uptime) = (s.gen, s.mode, s.started.elapsed());
+                        let reason = frame.reason.clone().unwrap_or_default();
+                        let tx = self.tx.clone();
+                        tokio::spawn(async move {
+                            let _ = tx.send(Msg::SessionExit { gen, mode, reason, uptime }).await;
+                        });
+                    }
+                }
             }
             return;
         }
@@ -688,7 +935,7 @@ impl App {
     async fn send(&mut self, msg: serde_json::Value) {
         if let Some(s) = self.session.as_mut() {
             let line = msg.to_string() + "\n";
-            let _ = s.stdin.write_all(line.as_bytes()).await;
+            s.send_input(&line).await;
         }
     }
 
@@ -931,6 +1178,8 @@ pub async fn run(args: Args) -> Result<()> {
         fg_poll_at: None,
         settle_at: None,
         mouse_grabbed: tty, // startup wrote ?1002h when we're a tty
+        mux_tx: None,
+        mux_api_sid: 0,
     };
     app.connect(if app.args.always_control { Mode::Control } else { Mode::Observe }).await;
 
@@ -963,6 +1212,29 @@ pub async fn run(args: Args) -> Result<()> {
                     None => break,
                     Some(Msg::Frame { gen, frame }) => app.handle_frame(gen, frame),
                     Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
+                    Some(Msg::MuxExit { sid, code }) => {
+                        // rebuild a SessionExit from the current session state; the
+                        // reader can't know the exited mode / uptime for a sid.
+                        let info = app.session.as_ref().filter(|s| s.gen == sid).map(|s| (s.mode, s.started.elapsed()));
+                        if let Some((mode, uptime)) = info {
+                            app.handle_exit(sid, mode, format!("agent child exit code {code}"), uptime);
+                        }
+                    }
+                    Some(Msg::MuxReconnecting) => {
+                        // status-only: the mux is re-opening the agent link; the
+                        // session lives and a full frame clears this on recovery.
+                        app.renderer.status("mux reconnecting…");
+                        app.paint();
+                    }
+                    Some(Msg::MuxClosed) => {
+                        // the wrapper→mux socket dropped; force a fresh connect and
+                        // route the current session through the reconnect flow.
+                        app.mux_tx = None;
+                        let info = app.session.as_ref().map(|s| (s.gen, s.mode, s.started.elapsed()));
+                        if let Some((gen, mode, uptime)) = info {
+                            app.handle_exit(gen, mode, "mux socket closed".into(), uptime);
+                        }
+                    }
                     Some(Msg::Stdin(buf)) => app.handle_stdin(buf).await,
                     // keep the last good classification if a poll failed (None)
                     Some(Msg::Foreground(v)) => if v.is_some() {
@@ -1034,13 +1306,13 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    // clean shutdown: release control if held, kill the ssh child, restore tty
+    // clean shutdown: release control if held, tear the session down, restore tty
     if let Some(mut s) = app.session.take() {
         if s.mode == Mode::Control {
-            let _ = s.stdin.write_all(b"{\"type\":\"terminal.release\"}\n").await;
+            s.send_input("{\"type\":\"terminal.release\"}\n").await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        unsafe { libc::kill(s.pid, libc::SIGTERM) };
+        s.terminate();
     }
     if tty {
         write_stdout("\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
@@ -1089,7 +1361,99 @@ mod tests {
         assert_eq!(a.pane_target, "w9:p1");
         assert_eq!(a.remote_bin, "/opt/herdr");
         assert_eq!((a.cols, a.rows), (176, 66));
+        assert!(a.mux_sock.is_none());
         assert!(parse_args(&["onlyone".to_string()]).is_err());
         assert!(parse_args(&["a".into(), "b".into(), "--visibility-file".into(), "x".into()]).is_err());
+    }
+
+    #[test]
+    fn arg_parsing_mux_sock() {
+        let argv: Vec<String> =
+            ["work", "w9:p1", "--mux-sock", "/tmp/work-mux.sock", "--ctl-path", "/tmp/work.ctl"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let a = parse_args(&argv).unwrap();
+        assert_eq!(a.mux_sock.as_deref(), Some("/tmp/work-mux.sock"));
+        // --ctl-path is still parsed alongside (kept for the ssh fallback)
+        assert_eq!(a.ctl_path.as_deref(), Some("/tmp/work.ctl"));
+    }
+
+    // ---- pure mux-line → event mapping ----
+
+    #[test]
+    fn mux_line_frame_carries_sid_as_gen() {
+        // an `l` op wrapping a terminal.frame → Frame(sid, parsed frame)
+        let inner = r#"{"type":"terminal.frame","seq":7,"full":true,"width":4,"height":1,"bytes":"aGk="}"#;
+        let line = protocol::Msg::Line { sid: 12, d: inner.to_string() }.to_line();
+        match mux_line_to_event(&line) {
+            MuxEvent::Frame(sid, frame) => {
+                assert_eq!(sid, 12, "sid is used as the session gen");
+                assert_eq!(frame.kind, "terminal.frame");
+                assert_eq!(frame.seq, Some(7));
+                assert_eq!(frame.full, Some(true));
+                assert_eq!(frame.bytes.as_deref(), Some("aGk="));
+            }
+            other => panic!("expected Frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mux_line_terminal_closed_is_a_frame_not_reconnecting() {
+        // terminal.closed arrives as an `l` op too; it maps to a Frame so
+        // handle_frame runs its existing terminal.closed path.
+        let inner = r#"{"type":"terminal.closed","reason":"already has an attached client"}"#;
+        let line = protocol::Msg::Line { sid: 3, d: inner.to_string() }.to_line();
+        match mux_line_to_event(&line) {
+            MuxEvent::Frame(3, frame) => {
+                assert_eq!(frame.kind, "terminal.closed");
+                assert_eq!(frame.reason.as_deref(), Some("already has an attached client"));
+            }
+            other => panic!("expected Frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mux_line_exit_maps_to_exit() {
+        let line = protocol::Msg::Exit { sid: 5, code: -1 }.to_line();
+        match mux_line_to_event(&line) {
+            MuxEvent::Exit(5, -1) => {}
+            other => panic!("expected Exit(5,-1), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mux_line_api_res_classifies_foreground() {
+        // the agent hands back the bare `result`; classify_result re-wraps it
+        let result = json!({ "process_info": { "foreground_processes": [{ "name": "zsh" }] } });
+        let line = protocol::Msg::ApiRes { sid: MUX_API_SID_BASE + 1, result: Some(result), error: None }.to_line();
+        match mux_line_to_event(&line) {
+            MuxEvent::Foreground(Some(Foreground::Shell)) => {}
+            other => panic!("expected Foreground(Shell), got {other:?}"),
+        }
+        // an error api_res (no result) → indeterminate, keep last value
+        let errline = protocol::Msg::ApiRes { sid: 1, result: None, error: Some("boom".into()) }.to_line();
+        assert!(matches!(mux_line_to_event(&errline), MuxEvent::Foreground(None)));
+    }
+
+    #[test]
+    fn mux_line_reconnecting_blip() {
+        // the mux's raw notice (no `closed` op in protocol::Msg) → Reconnecting
+        let line = "{\"op\":\"closed\",\"sid\":7,\"reason\":\"mux reconnecting\"}\n";
+        assert!(matches!(mux_line_to_event(line), MuxEvent::Reconnecting));
+        assert!(is_mux_reconnecting(line));
+    }
+
+    #[test]
+    fn mux_line_ignores_noise() {
+        // ping / hello / blank / garbage carry nothing actionable for the wrapper
+        assert!(matches!(mux_line_to_event(&protocol::Msg::Ping { seq: 1 }.to_line()), MuxEvent::Ignore));
+        let hello = protocol::Msg::Hello { version: "1".into(), herdr_socket: "/s".into() }.to_line();
+        assert!(matches!(mux_line_to_event(&hello), MuxEvent::Ignore));
+        assert!(matches!(mux_line_to_event(""), MuxEvent::Ignore));
+        assert!(matches!(mux_line_to_event("not json"), MuxEvent::Ignore));
+        // an `l` op whose payload isn't a valid frame is dropped, not crashed
+        let badframe = protocol::Msg::Line { sid: 1, d: "not a frame".into() }.to_line();
+        assert!(matches!(mux_line_to_event(&badframe), MuxEvent::Ignore));
     }
 }

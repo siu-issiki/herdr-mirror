@@ -287,6 +287,9 @@ fn cmd_for_pane(deps: &ConvergeDeps, sizes: &HashMap<String, LayoutRect>) -> imp
     // daemon's ControlMaster socket for this host (see remote.rs); the streamer
     // reuses it for cheap foreground polls
     let ctl_path = deps.state_dir.join(format!("{}.ctl", deps.host.name)).display().to_string();
+    // host's single mux socket; the streamer prefers it and falls back to the
+    // ssh path (via --ctl-path) when it isn't reachable yet at startup.
+    let mux_sock = crate::mux::sock_path(&deps.state_dir, &deps.host.name).display().to_string();
     let sizes = sizes.clone();
     move |pane_id: &str| {
         let mut argv = vec![
@@ -301,6 +304,7 @@ fn cmd_for_pane(deps: &ConvergeDeps, sizes: &HashMap<String, LayoutRect>) -> imp
             argv.push("--always-control".into());
         }
         argv.extend(["--ctl-path".into(), ctl_path.clone()]);
+        argv.extend(["--mux-sock".into(), mux_sock.clone()]);
         if let Some(rect) = sizes.get(pane_id) {
             argv.extend([
                 "--cols".into(),
