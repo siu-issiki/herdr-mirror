@@ -249,7 +249,7 @@ fn spawn_session(args: &Args, mode: Mode, cols: usize, rows: usize, gen: u64, tx
         rows,
         takeover
     );
-    let mut sc = tokio::process::Command::new("ssh");
+    let mut sc = tokio::process::Command::new(crate::remote::ssh_bin());
     // reuse the daemon's ControlMaster when it's alive; a missing socket
     // falls back to a direct connection (same pattern as foreground polls)
     if let Some(path) = &args.ctl_path {

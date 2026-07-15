@@ -484,7 +484,7 @@ pub async fn sync_branches(
     }
     let script = branch_probe_script(probes);
     // -S <ctl> reuses the master; with no master it connects directly (graceful).
-    let out = tokio::process::Command::new("ssh")
+    let out = tokio::process::Command::new(crate::remote::ssh_bin())
         .arg("-S")
         .arg(ctl_path)
         .args(crate::remote::SSH_COMMON_OPTS)

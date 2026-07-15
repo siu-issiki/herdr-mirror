@@ -30,7 +30,7 @@ use tokio::time::{timeout, Instant};
 
 use crate::config::HostConfig;
 use crate::protocol::{parse_line, Msg};
-use crate::remote::SSH_COMMON_OPTS;
+use crate::remote::{ssh_bin, SSH_COMMON_OPTS};
 use crate::util::{err, Result};
 
 /// Remote path of the agent binary when a host doesn't override `agent_bin`.
@@ -448,7 +448,7 @@ fn build_command(cfg: &MuxConfig) -> Command {
         cmd.args(&argv[1..]);
         cmd
     } else {
-        let mut cmd = Command::new("ssh");
+        let mut cmd = Command::new(ssh_bin());
         cmd.args(SSH_COMMON_OPTS);
         cmd.arg(&cfg.target);
         cmd.arg(format!("exec {} agent", cfg.agent_bin));
@@ -599,7 +599,7 @@ async fn deploy(cfg: &MuxConfig) -> Result<()> {
     let script = format!(
         "mkdir -p {dir} && cat > {bin}.new && chmod +x {bin}.new && mv {bin}.new {bin}"
     );
-    let mut cmd = Command::new("ssh");
+    let mut cmd = Command::new(ssh_bin());
     cmd.args(SSH_COMMON_OPTS)
         .arg(&cfg.target)
         .arg(script)

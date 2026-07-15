@@ -15,7 +15,7 @@ use std::process::Stdio;
 use tokio::process::Command;
 
 use crate::pane::sh_quote;
-use crate::remote::SSH_COMMON_OPTS;
+use crate::remote::{ssh_bin, SSH_COMMON_OPTS};
 
 /// Interactive shells: at a prompt these don't enable mouse reporting, so mouse
 /// events over them should stay local rather than being forwarded to the pty.
@@ -97,7 +97,7 @@ pub async fn poll(
     // remote_bin stays unquoted for remote-shell ~ expansion, matching the
     // observe session's command construction
     let cmd = format!("exec {} pane process-info --pane {}", remote_bin, sh_quote(pane));
-    let mut sc = Command::new("ssh");
+    let mut sc = Command::new(ssh_bin());
     // reuse the daemon's ControlMaster when given so the poll skips the
     // handshake; `-S` without `-M` uses an existing master or, if the socket
     // isn't there, connects directly — so this degrades gracefully

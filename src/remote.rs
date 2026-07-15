@@ -27,6 +27,21 @@ pub const SSH_COMMON_OPTS: [&str; 6] = [
     "ServerAliveCountMax=3",
 ];
 
+/// Programmatic ssh must bypass PATH shims (a shim's death orphans the real
+/// ssh, so kills don't sever the connection). Absolute path first.
+pub fn ssh_bin() -> &'static str {
+    static BIN: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        if let Ok(p) = std::env::var("HERDR_MIRROR_SSH") {
+            return Box::leak(p.into_boxed_str());
+        }
+        if std::path::Path::new("/usr/bin/ssh").exists() {
+            return "/usr/bin/ssh";
+        }
+        "ssh"
+    })
+}
+
 #[derive(Debug)]
 pub struct RemoteStatus {
     pub socket: String,
@@ -41,7 +56,7 @@ struct SshOutput {
 }
 
 async fn ssh(args: &[String], timeout_ms: u64) -> SshOutput {
-    let fut = Command::new("ssh")
+    let fut = Command::new(ssh_bin())
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
