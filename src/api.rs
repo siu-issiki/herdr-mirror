@@ -30,30 +30,45 @@ pub struct EventEnvelope {
     pub data: Value,
 }
 
+/// A herdr API client. `Socket` speaks the raw herdr JSON protocol on a unix
+/// socket (one connection per request); `Mux` rides the daemon's single mux ssh
+/// connection through the local mux socket. Both expose the same
+/// method+params → result surface, so converge/mirror call sites are transport-
+/// agnostic — swapping the daemon's remote transport is just a variant swap.
 #[derive(Clone)]
-pub struct ApiClient {
-    socket_path: PathBuf,
+pub enum ApiClient {
+    Socket(PathBuf),
+    Mux(crate::muxclient::MuxApi),
 }
 
 impl ApiClient {
-    /// Bind a client to a socket path without probing it. Each request/subscribe
+    /// Bind a socket client to a path without probing it. Each request/subscribe
     /// opens its own connection, so no liveness is implied here.
     pub fn at(socket_path: &Path) -> ApiClient {
-        ApiClient { socket_path: socket_path.to_path_buf() }
+        ApiClient::Socket(socket_path.to_path_buf())
     }
 
     /// Connect-check the socket (one ping round-trip), then hand back a client.
     pub async fn connect(socket_path: &Path) -> Result<ApiClient> {
-        let client = ApiClient { socket_path: socket_path.to_path_buf() };
+        let client = ApiClient::Socket(socket_path.to_path_buf());
         client.request("ping", json!({})).await?;
         Ok(client)
     }
 
-    /// One request on a fresh connection; the server closes after responding.
+    /// Wrap a mux-socket client as an `ApiClient` (the daemon's remote transport).
+    pub fn mux(mux: crate::muxclient::MuxApi) -> ApiClient {
+        ApiClient::Mux(mux)
+    }
+
+    /// One request; the socket backend closes after responding, the mux backend
+    /// rides the shared connection.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        timeout(REQUEST_TIMEOUT, self.request_inner(method, params))
-            .await
-            .map_err(|_| err(format!("api timeout: {method}")))?
+        match self {
+            ApiClient::Socket(path) => timeout(REQUEST_TIMEOUT, request_inner(path, method, params))
+                .await
+                .map_err(|_| err(format!("api timeout: {method}")))?,
+            ApiClient::Mux(m) => m.request(method, params).await,
+        }
     }
 
     pub async fn request_t<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
@@ -61,10 +76,20 @@ impl ApiClient {
         serde_json::from_value(v).map_err(|e| err(format!("{method}: bad response shape: {e}")))
     }
 
-    async fn request_inner(&self, method: &str, params: Value) -> Result<Value> {
-        let stream = timeout(CONNECT_TIMEOUT, UnixStream::connect(&self.socket_path))
+    /// Held connection pushing events. Pull with `EventStream::next()`; a
+    /// `None` means the stream dropped (resubscribe from the caller).
+    pub async fn subscribe(&self, subscriptions: Vec<Value>) -> Result<EventStream> {
+        match self {
+            ApiClient::Socket(path) => Ok(EventStream::Socket(subscribe_inner(path, subscriptions).await?)),
+            ApiClient::Mux(m) => Ok(EventStream::Mux(m.subscribe(subscriptions).await?)),
+        }
+    }
+}
+
+async fn request_inner(socket_path: &Path, method: &str, params: Value) -> Result<Value> {
+        let stream = timeout(CONNECT_TIMEOUT, UnixStream::connect(socket_path))
             .await
-            .map_err(|_| err(format!("api connect timeout: {}", self.socket_path.display())))??;
+            .map_err(|_| err(format!("api connect timeout: {}", socket_path.display())))??;
         let (read, mut write) = stream.into_split();
         let id = format!("mirror_{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
         let line = serde_json::to_string(&json!({ "id": id, "method": method, "params": params }))? + "\n";
@@ -88,41 +113,55 @@ impl ApiClient {
         Err(err(format!("api closed before response: {method}")))
     }
 
-    /// Held connection pushing events. Pull with `EventStream::next()`; a
-    /// `None` means the stream dropped (resubscribe from the caller).
-    pub async fn subscribe(&self, subscriptions: Vec<Value>) -> Result<EventStream> {
-        let stream = timeout(CONNECT_TIMEOUT, UnixStream::connect(&self.socket_path))
-            .await
-            .map_err(|_| err(format!("api connect timeout: {}", self.socket_path.display())))??;
-        let (read, mut write) = stream.into_split();
-        let id = format!("mirror_{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
-        let line = serde_json::to_string(
-            &json!({ "id": id, "method": "events.subscribe", "params": { "subscriptions": subscriptions } }),
-        )? + "\n";
-        write.write_all(line.as_bytes()).await?;
-        let mut lines = BufReader::new(read).lines();
-        // first line is the ack (or an error)
-        let ack = timeout(Duration::from_secs(10), lines.next_line())
-            .await
-            .map_err(|_| err("subscribe ack timeout"))??
-            .ok_or_else(|| err("subscribe: stream closed before ack"))?;
-        let msg: Value = serde_json::from_str(&ack)?;
-        if let Some(e) = msg.get("error") {
-            let text = e.get("message").and_then(|v| v.as_str()).unwrap_or("subscribe failed");
-            return Err(err(text.to_string()));
-        }
-        Ok(EventStream { lines, _write: write })
+/// Open a held events.subscribe connection on a raw herdr socket.
+async fn subscribe_inner(socket_path: &Path, subscriptions: Vec<Value>) -> Result<SocketEventStream> {
+    let stream = timeout(CONNECT_TIMEOUT, UnixStream::connect(socket_path))
+        .await
+        .map_err(|_| err(format!("api connect timeout: {}", socket_path.display())))??;
+    let (read, mut write) = stream.into_split();
+    let id = format!("mirror_{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
+    let line = serde_json::to_string(
+        &json!({ "id": id, "method": "events.subscribe", "params": { "subscriptions": subscriptions } }),
+    )? + "\n";
+    write.write_all(line.as_bytes()).await?;
+    let mut lines = BufReader::new(read).lines();
+    // first line is the ack (or an error)
+    let ack = timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .map_err(|_| err("subscribe ack timeout"))??
+        .ok_or_else(|| err("subscribe: stream closed before ack"))?;
+    let msg: Value = serde_json::from_str(&ack)?;
+    if let Some(e) = msg.get("error") {
+        let text = e.get("message").and_then(|v| v.as_str()).unwrap_or("subscribe failed");
+        return Err(err(text.to_string()));
     }
+    Ok(SocketEventStream { lines, _write: write })
 }
 
-pub struct EventStream {
-    lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
-    _write: tokio::net::unix::OwnedWriteHalf, // keeps the connection open
+/// A held event stream, either a raw herdr socket connection or a mux subscription.
+pub enum EventStream {
+    Socket(SocketEventStream),
+    Mux(crate::muxclient::MuxEventStream),
 }
 
 impl EventStream {
     /// Next event; `None` when the stream has dropped.
     pub async fn next(&mut self) -> Option<EventEnvelope> {
+        match self {
+            EventStream::Socket(s) => s.next().await,
+            EventStream::Mux(m) => m.next().await,
+        }
+    }
+}
+
+pub struct SocketEventStream {
+    lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    _write: tokio::net::unix::OwnedWriteHalf, // keeps the connection open
+}
+
+impl SocketEventStream {
+    /// Next event; `None` when the stream has dropped.
+    async fn next(&mut self) -> Option<EventEnvelope> {
         loop {
             match self.lines.next_line().await {
                 Ok(Some(line)) => {

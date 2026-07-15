@@ -14,6 +14,7 @@ mod foreground;
 mod grid;
 mod mirror;
 mod mux;
+mod muxclient;
 mod pane;
 mod predict;
 mod protocol;

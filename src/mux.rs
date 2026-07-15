@@ -24,7 +24,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
 
@@ -472,6 +472,7 @@ async fn connect_once(
     cfg: &MuxConfig,
     core_tx: &mpsc::UnboundedSender<CoreEvent>,
     ssh_pid: &AtomicI32,
+    ready_tx: &watch::Sender<bool>,
 ) -> Attempt {
     let mut cmd = build_command(cfg);
     cmd.stdin(std::process::Stdio::piped())
@@ -513,6 +514,9 @@ async fn connect_once(
     let (atx, arx) = mpsc::unbounded_channel::<String>();
     tokio::spawn(agent_stdin_writer(arx, stdin));
     let _ = core_tx.send(CoreEvent::AgentConnected { tx: atx });
+    // publish readiness: the daemon's own mux client waits on this before it
+    // connects and treats a flip back to false as "link down → reconverge".
+    let _ = ready_tx.send(true);
 
     let start = Instant::now();
     // Any non-line result (EOF, read error, or >20s silence) means a dead link.
@@ -542,15 +546,23 @@ async fn agent_stdin_writer(
 
 /// Reconnect forever: spawn, run, then back off — self-deploying the binary
 /// once if the remote agent is absent or stale.
-async fn connection_task(cfg: Arc<MuxConfig>, core_tx: mpsc::UnboundedSender<CoreEvent>, ssh_pid: Arc<AtomicI32>) {
+async fn connection_task(
+    cfg: Arc<MuxConfig>,
+    core_tx: mpsc::UnboundedSender<CoreEvent>,
+    ssh_pid: Arc<AtomicI32>,
+    ready_tx: watch::Sender<bool>,
+) {
     let mut deployed = false;
     let mut backoff_idx = 0usize;
     loop {
-        let outcome = connect_once(&cfg, &core_tx, &ssh_pid).await;
+        let outcome = connect_once(&cfg, &core_tx, &ssh_pid, &ready_tx).await;
         ssh_pid.store(-1, Ordering::SeqCst);
         // Whether or not we were ever "connected", make the core drop stale
         // one-shots and mark itself offline (idempotent when never connected).
         let _ = core_tx.send(CoreEvent::AgentDisconnected);
+        // link is down: notify the daemon so it marks mirrors unknown and
+        // reconverges when readiness returns.
+        let _ = ready_tx.send(false);
         match outcome {
             Attempt::Ran(uptime) => {
                 if uptime >= STABLE_UPTIME {
@@ -646,7 +658,7 @@ async fn accept_loop(listener: UnixListener, core_tx: mpsc::UnboundedSender<Core
 /// Run the mux for one host until cancelled. Returns early (Ok) if another mux
 /// already owns the socket. All concurrent loops live in this one task so
 /// cancelling it tears the whole mux down.
-pub async fn serve(cfg: MuxConfig, ssh_pid: Arc<AtomicI32>) -> Result<()> {
+pub async fn serve(cfg: MuxConfig, ssh_pid: Arc<AtomicI32>, ready_tx: watch::Sender<bool>) -> Result<()> {
     let sock = sock_path(&cfg.state_dir, &cfg.host_name);
     // Multi-start guard: a live socket means another mux owns this host.
     if UnixStream::connect(&sock).await.is_ok() {
@@ -663,7 +675,7 @@ pub async fn serve(cfg: MuxConfig, ssh_pid: Arc<AtomicI32>) -> Result<()> {
     // them (and drops the ssh Child via kill_on_drop).
     tokio::select! {
         _ = core_task(core_rx) => {}
-        _ = connection_task(cfg.clone(), core_tx.clone(), ssh_pid) => {}
+        _ = connection_task(cfg.clone(), core_tx.clone(), ssh_pid, ready_tx) => {}
         r = accept_loop(listener, core_tx.clone()) => { r?; }
     }
     let _ = std::fs::remove_file(&sock);
@@ -674,9 +686,17 @@ pub async fn serve(cfg: MuxConfig, ssh_pid: Arc<AtomicI32>) -> Result<()> {
 pub struct MuxHandle {
     task: JoinHandle<()>,
     ssh_pid: Arc<AtomicI32>,
+    connected: watch::Receiver<bool>,
 }
 
 impl MuxHandle {
+    /// Watch the mux link state: `true` once the agent has said `hello`, `false`
+    /// again on every disconnect. The daemon's host task waits on this before
+    /// connecting its own mux client and reconverges when it flips.
+    pub fn ready(&self) -> watch::Receiver<bool> {
+        self.connected.clone()
+    }
+
     /// Stop the mux and kill its ssh child. Aborting first prevents the
     /// connection loop from re-spawning after we signal the transport; the
     /// killed ssh then drops the remote agent, which reaps its terminal
@@ -730,17 +750,19 @@ pub async fn run_cli(rest: &[String]) -> Result<()> {
         }
     }
     let cfg = MuxConfig { host_name: host, target, agent_bin, state_dir, spawn_cmd };
-    serve(cfg, Arc::new(AtomicI32::new(-1))).await
+    let (ready_tx, _ready_rx) = watch::channel(false);
+    serve(cfg, Arc::new(AtomicI32::new(-1)), ready_tx).await
 }
 
 /// Start a mux from an explicit config (used by `spawn` and the test harness).
 pub fn spawn_with(cfg: MuxConfig) -> MuxHandle {
     let ssh_pid = Arc::new(AtomicI32::new(-1));
     let pid = ssh_pid.clone();
+    let (ready_tx, ready_rx) = watch::channel(false);
     let task = tokio::spawn(async move {
-        let _ = serve(cfg, pid).await;
+        let _ = serve(cfg, pid, ready_tx).await;
     });
-    MuxHandle { task, ssh_pid }
+    MuxHandle { task, ssh_pid, connected: ready_rx }
 }
 
 #[cfg(test)]

@@ -20,15 +20,17 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use crate::api::{ApiClient, EventStream};
 use crate::config::{load_config, HostConfig};
 use crate::mirror::{
-    apply_remote_closes, converge, mark_unknown, mirror_source, push_pane_status, regroup_sidebar,
-    sync_branches, teardown, AgentInfo, ConvergeDeps,
+    apply_branch_probe_output, apply_remote_closes, branch_probe_script, converge, mark_unknown,
+    mirror_source, push_pane_status, regroup_sidebar, sync_branches, teardown, AgentInfo,
+    ConvergeDeps,
 };
+use crate::muxclient::MuxApi;
 use crate::state::{load_state, save_state, HostState};
 use crate::util::{err, now_iso, pid_alive, sleep_until_earliest, Env, Logger, Result};
 
@@ -70,6 +72,9 @@ struct HostCtx {
     local: ApiClient,
     log: Logger,
     close_remote_on_local_close: bool,
+    /// this host's mux socket (`<state_dir>/<host>-mux.sock`); the daemon's own
+    /// control-plane api/events/exec ride it instead of a private ControlMaster.
+    mux_sock: PathBuf,
 }
 
 const BROADCAST_SUBS: &[&str] = &[
@@ -175,19 +180,45 @@ async fn converge_and_branches(
     deps: &ConvergeDeps,
     branch_cache: &mut HashMap<String, Option<String>>,
     prefetch_tabs: &[String],
+    mux: Option<&MuxApi>,
 ) -> Result<(HostState, bool)> {
     let outcome = converge(deps, prefetch_tabs).await?;
-    let ctl = deps.state_dir.join(format!("{}.ctl", deps.host.name));
-    sync_branches(
-        &deps.host.target,
-        &ctl,
-        &deps.state_dir,
-        &deps.host.name,
-        &outcome.branch_probes,
-        branch_cache,
-        &deps.log,
-    )
-    .await;
+    let probes = &outcome.branch_probes;
+    if !probes.is_empty() {
+        match mux {
+            // daemon path: run the probe over the single mux ssh connection.
+            Some(m) => {
+                let script = branch_probe_script(probes);
+                match m.exec(&script).await {
+                    Ok((0, out)) => apply_branch_probe_output(
+                        &out,
+                        probes,
+                        branch_cache,
+                        &deps.state_dir,
+                        &deps.host.name,
+                        &deps.log,
+                    ),
+                    // non-zero or failed exec: leave planted HEADs/cache untouched
+                    // (same guard as the ssh path) so a blip can't wipe branches
+                    _ => deps.log.log(&format!("[{}] branch probe (mux exec) failed", deps.host.name)),
+                }
+            }
+            // daemon-less `once`: no mux running, use the legacy ssh probe.
+            None => {
+                let ctl = deps.state_dir.join(format!("{}.ctl", deps.host.name));
+                sync_branches(
+                    &deps.host.target,
+                    &ctl,
+                    &deps.state_dir,
+                    &deps.host.name,
+                    probes,
+                    branch_cache,
+                    &deps.log,
+                )
+                .await;
+            }
+        }
+    }
     Ok((outcome.state, outcome.pending_absences))
 }
 
@@ -197,9 +228,17 @@ async fn run_connected(
     ctx: &HostCtx,
     poke: &mut mpsc::Receiver<()>,
     backoff_idx: &mut usize,
+    mux_ready: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    let mut remote_host = crate::remote::RemoteHost::new(&ctx.host, &ctx.env_state_dir);
-    let (remote, _status) = remote_host.connect_api().await?;
+    // Wait for the host mux's single ssh connection to be up (agent said hello)
+    // before we do anything — this replaces the daemon's own ControlMaster +
+    // status probe. A flip back to false below means the link dropped.
+    wait_mux_ready(mux_ready).await?;
+    // Connect the daemon's own client to the mux socket; it now owns api /
+    // events / exec for the control plane. Retry briefly: readiness fires right
+    // as the agent handshakes, a hair before the socket may accept us.
+    let mux_api = connect_mux_client(&ctx.mux_sock).await?;
+    let remote = ApiClient::mux(mux_api.clone());
     *backoff_idx = 0;
     let deps = ConvergeDeps {
         local: ctx.local.clone(),
@@ -226,7 +265,8 @@ async fn run_connected(
     // tabs a pending creation touched — prefetch their layouts in the next
     // converge so the layout.export overlaps the snapshot round-trip
     let mut pending_layout_hints: Vec<String> = Vec::new();
-    let (state, pending_absences) = converge_and_branches(&deps, &mut branch_cache, &[]).await?;
+    let (state, pending_absences) =
+        converge_and_branches(&deps, &mut branch_cache, &[], Some(&mux_api)).await?;
     if pending_absences {
         converge_at.get_or_insert(Instant::now() + Duration::from_millis(1000));
     }
@@ -286,6 +326,14 @@ async fn run_connected(
             Some(()) = poke.recv() => {
                 converge_at.get_or_insert(Instant::now());
             }
+            // the mux link state changed: a drop to false means the single ssh
+            // connection died — bail so host_task marks mirrors unknown and
+            // reconverges once readiness returns.
+            res = mux_ready.changed() => {
+                if res.is_err() || !*mux_ready.borrow() {
+                    return Err(err("mux link down"));
+                }
+            }
             _ = sleep => {
                 let now = Instant::now();
                 if status_at.is_some_and(|t| t <= now) {
@@ -306,7 +354,8 @@ async fn run_connected(
                 if converge_at.is_some_and(|t| t <= now) {
                     converge_at = None;
                     let hints = std::mem::take(&mut pending_layout_hints);
-                    let (state, pending_absences) = converge_and_branches(&deps, &mut branch_cache, &hints).await?;
+                    let (state, pending_absences) =
+                        converge_and_branches(&deps, &mut branch_cache, &hints, Some(&mux_api)).await?;
                     if pending_absences {
                         // a workspace/tab/pane was missing for the first time this
                         // pass — absent_twice needs one more converge to confirm
@@ -323,10 +372,10 @@ async fn run_connected(
     }
 }
 
-async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
+async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>, mut mux_ready: watch::Receiver<bool>) {
     let mut backoff_idx = 0usize;
     loop {
-        let e = match run_connected(&ctx, &mut poke, &mut backoff_idx).await {
+        let e = match run_connected(&ctx, &mut poke, &mut backoff_idx, &mut mux_ready).await {
             Ok(()) => unreachable!("run_connected only returns on error"),
             Err(e) => e,
         };
@@ -338,6 +387,35 @@ async fn host_task(ctx: HostCtx, mut poke: mpsc::Receiver<()>) {
         tokio::time::sleep(Duration::from_secs(delay)).await;
         // drain stale pokes accumulated while down (reconnect converges anyway)
         while poke.try_recv().is_ok() {}
+    }
+}
+
+/// Block until the host mux reports its ssh link is up (`ready == true`). Errors
+/// only if the mux task is gone (sender dropped) — a shutting-down daemon.
+async fn wait_mux_ready(mux_ready: &mut watch::Receiver<bool>) -> Result<()> {
+    loop {
+        if *mux_ready.borrow_and_update() {
+            return Ok(());
+        }
+        mux_ready.changed().await.map_err(|_| err("mux task gone"))?;
+    }
+}
+
+/// Connect the daemon's own client to the host mux socket, retrying briefly:
+/// readiness fires the instant the agent handshakes, a hair before the local
+/// socket may accept a new client.
+async fn connect_mux_client(sock: &std::path::Path) -> Result<MuxApi> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match MuxApi::connect(sock).await {
+            Ok(m) => return Ok(m),
+            Err(e) => {
+                if Instant::now() >= deadline {
+                    return Err(e);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
     }
 }
 
@@ -431,9 +509,16 @@ pub async fn cmd_run(env: Env) -> Result<()> {
     ));
 
     let local = ApiClient::connect(&env.local_socket).await?;
+    // Single-connection mux: one long-lived ssh per host. The control plane now
+    // rides this — api/events/exec go through the mux socket, so the daemon no
+    // longer opens its own ControlMaster or api-socket forward. Spawn the muxes
+    // first so each host task can wait on its readiness watch before converging.
+    let muxes: Vec<crate::mux::MuxHandle> =
+        config.hosts.iter().map(|h| crate::mux::spawn(h, &env.state_dir)).collect();
+
     let mut pokers: Vec<mpsc::Sender<()>> = Vec::new();
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    for h in &config.hosts {
+    for (h, mux) in config.hosts.iter().zip(muxes.iter()) {
         let (tx, rx) = mpsc::channel(8);
         pokers.push(tx);
         let ctx = HostCtx {
@@ -443,13 +528,10 @@ pub async fn cmd_run(env: Env) -> Result<()> {
             local: local.clone(),
             log: log.clone(),
             close_remote_on_local_close: config.close_remote_on_local_close,
+            mux_sock: crate::mux::sock_path(&env.state_dir, &h.name),
         };
-        tasks.push(tokio::spawn(host_task(ctx, rx)));
+        tasks.push(tokio::spawn(host_task(ctx, rx, mux.ready())));
     }
-    // Single-connection mux: one per host, running alongside the legacy
-    // per-pane/ControlMaster data plane (nothing connects to it yet — phase 2).
-    let muxes: Vec<crate::mux::MuxHandle> =
-        config.hosts.iter().map(|h| crate::mux::spawn(h, &env.state_dir)).collect();
 
     let prefixes: Vec<String> = config.hosts.iter().map(|h| h.prefix.clone()).collect();
     tasks.push(tokio::spawn(local_events_task(
@@ -626,9 +708,10 @@ pub async fn cmd_once(env: Env) -> Result<()> {
             log: log.clone(),
             close_remote_on_local_close: config.close_remote_on_local_close,
         };
-        // one-shot: a throwaway cache means every mirror's branch is (re)written
+        // one-shot: a throwaway cache means every mirror's branch is (re)written.
+        // No daemon/mux running here, so the branch probe uses the legacy ssh path.
         let mut branch_cache = HashMap::new();
-        converge_and_branches(&deps, &mut branch_cache, &[]).await?;
+        converge_and_branches(&deps, &mut branch_cache, &[], None).await?;
         log.log(&format!("[{}] one-shot mirror complete", h.name));
     }
     Ok(())

@@ -92,8 +92,18 @@ pub async fn run(env: Env, kind: &str, direction: Option<&str>) -> Result<()> {
         .or_else(|| config.default_host().cloned())
         .ok_or_else(|| err("no hosts configured"))?;
 
-    let mut remote = RemoteHost::new(&host, &env.state_dir);
-    let api = remote.connect_api_fast().await?;
+    // Prefer the daemon's single mux ssh connection: if its socket accepts us,
+    // run the create over an `api` op like every other client. Only when the mux
+    // isn't reachable (no daemon, or it's down) fall back to the legacy per-action
+    // ControlMaster + api-socket forward.
+    let mux_sock = crate::mux::sock_path(&env.state_dir, &host.name);
+    let api = match crate::muxclient::MuxApi::connect(&mux_sock).await {
+        Ok(m) => ApiClient::mux(m),
+        Err(_) => {
+            let mut remote = RemoteHost::new(&host, &env.state_dir);
+            remote.connect_api_fast().await?
+        }
+    };
 
     // cwd inheritance comes from the REMOTE side: the remote pane behind the
     // focused mirror pane knows its real cwd; local cwds are meaningless there.

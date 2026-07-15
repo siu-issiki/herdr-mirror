@@ -420,47 +420,31 @@ pub fn parse_branch_batch(stdout: &str) -> Vec<(String, Option<String>)> {
 /// the daemon's ControlMaster), then refresh each mirror workspace's planted git
 /// HEAD when it changed. `cache` (remote_ws_id -> last-applied branch, `None` =
 /// no repo) suppresses redundant writes. `probes` is `(remote_ws_id, remote cwd)`.
-pub async fn sync_branches(
-    ssh_target: &str,
-    ctl_path: &std::path::Path,
-    state_dir: &std::path::Path,
-    host_name: &str,
-    probes: &[(String, String)],
-    cache: &mut HashMap<String, Option<String>>,
-    log: &Logger,
-) {
-    if probes.is_empty() {
-        return;
-    }
-    // for d in 'cwd1' 'cwd2' ...; do <branch of $d or -> ; done  — one round trip,
-    // tab-separated output. -q makes symbolic-ref silent on detached/non-git.
+/// The one-round-trip shell that reports each probe cwd's git branch (or `-`).
+/// Tab-separated `cwd<TAB>branch` lines; `-q` keeps symbolic-ref silent on
+/// detached/non-git dirs. Runnable over ssh (daemon-less `once`) or mux exec.
+pub fn branch_probe_script(probes: &[(String, String)]) -> String {
     let dirs = probes.iter().map(|(_, cwd)| sh_quote(cwd)).collect::<Vec<_>>().join(" ");
-    let script = format!(
+    format!(
         "for d in {dirs}; do b=$(git -C \"$d\" symbolic-ref --short -q HEAD 2>/dev/null) || b=-; \
          [ -n \"$b\" ] || b=-; printf '%s\\t%s\\n' \"$d\" \"$b\"; done"
-    );
-    // -S <ctl> reuses the master; with no master it connects directly (graceful).
-    let out = tokio::process::Command::new("ssh")
-        .arg("-S")
-        .arg(ctl_path)
-        .args(crate::remote::SSH_COMMON_OPTS)
-        .arg(ssh_target)
-        .arg(&script)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await;
-    let out = match out {
-        Ok(o) if o.status.success() => o,
-        // ssh failed entirely — leave every planted HEAD and the cache untouched
-        // so a transient drop can't wipe branches off the sidebar
-        _ => {
-            log.log(&format!("[{host_name}] branch probe ssh failed"));
-            return;
-        }
-    };
-    let parsed = parse_branch_batch(&String::from_utf8_lossy(&out.stdout));
+    )
+}
+
+/// Apply a branch-probe script's stdout to the mirror workspaces: plant/remove
+/// each proxy `.git/HEAD`, skipping unchanged branches via `cache`. Transport-
+/// agnostic — the reconciliation logic here is identical whether the probe ran
+/// over ssh or the mux. Only ever called with a probe that actually succeeded;
+/// a failed probe must leave planted HEADs and the cache untouched.
+pub fn apply_branch_probe_output(
+    stdout: &str,
+    probes: &[(String, String)],
+    cache: &mut HashMap<String, Option<String>>,
+    state_dir: &std::path::Path,
+    host_name: &str,
+    log: &Logger,
+) {
+    let parsed = parse_branch_batch(stdout);
     let by_cwd: HashMap<&str, &Option<String>> =
         parsed.iter().map(|(d, b)| (d.as_str(), b)).collect();
     for (ws, cwd) in probes {
@@ -482,6 +466,52 @@ pub async fn sync_branches(
         }
         cache.insert(ws.clone(), branch);
     }
+}
+
+/// Legacy ssh path for the branch probe (used by the daemon-less `once` command;
+/// the daemon runs the same probe over the mux). Reuses the master via `-S`.
+pub async fn sync_branches(
+    ssh_target: &str,
+    ctl_path: &std::path::Path,
+    state_dir: &std::path::Path,
+    host_name: &str,
+    probes: &[(String, String)],
+    cache: &mut HashMap<String, Option<String>>,
+    log: &Logger,
+) {
+    if probes.is_empty() {
+        return;
+    }
+    let script = branch_probe_script(probes);
+    // -S <ctl> reuses the master; with no master it connects directly (graceful).
+    let out = tokio::process::Command::new("ssh")
+        .arg("-S")
+        .arg(ctl_path)
+        .args(crate::remote::SSH_COMMON_OPTS)
+        .arg(ssh_target)
+        .arg(&script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await;
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        // ssh failed entirely — leave every planted HEAD and the cache untouched
+        // so a transient drop can't wipe branches off the sidebar
+        _ => {
+            log.log(&format!("[{host_name}] branch probe ssh failed"));
+            return;
+        }
+    };
+    apply_branch_probe_output(
+        &String::from_utf8_lossy(&out.stdout),
+        probes,
+        cache,
+        state_dir,
+        host_name,
+        log,
+    );
 }
 
 /// Is this remote pane another herdr-mirror's streamer pane? Read from the
