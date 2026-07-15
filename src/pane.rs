@@ -142,6 +142,10 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
     Ok(args)
 }
 
+/// Timeout sentinel from `await_claim` — distinguishes "keep waiting" from a
+/// real error claim when the caller staggers the wait.
+const CLAIM_TIMEOUT_MSG: &str = "timed out waiting for the remote split";
+
 /// Poll this pending pane's claim file for the remote pane id the action is
 /// splitting for us, or a failure. Returns `Ok(remote_pane_id)` on a `pane`
 /// claim, `Err(msg)` on an `error` claim or timeout. Pure-ish: the state dir
@@ -173,7 +177,7 @@ async fn await_claim(
             }
         }
         if Instant::now() >= deadline {
-            return Err("timed out waiting for the remote split".into());
+            return Err(CLAIM_TIMEOUT_MSG.into());
         }
         tokio::time::sleep(poll_interval).await;
     }
@@ -1287,11 +1291,29 @@ pub async fn run(args: Args) -> Result<()> {
     // failure or timeout paints the reason briefly, then we exit so the pane
     // closes on its own.
     if app.args.pending {
-        app.renderer.status("connecting…");
-        app.paint();
         let self_pane_id = std::env::var("HERDR_PANE_ID").unwrap_or_default();
         let state_dir = crate::util::default_state_dir();
-        match await_claim(&state_dir, &self_pane_id, PENDING_POLL_INTERVAL, PENDING_TIMEOUT).await {
+        // resolve silently first: the fast path lands well under a second and
+        // flashing a status bar for it reads as flicker. Only a slow resolve
+        // paints "connecting…".
+        const SILENT_GRACE: Duration = Duration::from_millis(800);
+        let first =
+            await_claim(&state_dir, &self_pane_id, PENDING_POLL_INTERVAL, SILENT_GRACE).await;
+        let resolved = match first {
+            Err(msg) if msg == CLAIM_TIMEOUT_MSG => {
+                app.renderer.status("connecting…");
+                app.paint();
+                await_claim(
+                    &state_dir,
+                    &self_pane_id,
+                    PENDING_POLL_INTERVAL,
+                    PENDING_TIMEOUT.saturating_sub(SILENT_GRACE),
+                )
+                .await
+            }
+            other => other,
+        };
+        match resolved {
             Ok(remote_pane) => {
                 app.args.pane_target = remote_pane;
                 app.args.pending = false;
