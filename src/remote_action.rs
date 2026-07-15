@@ -28,14 +28,43 @@ use crate::state::{load_state, HostState};
 use crate::util::{err, Env, Result};
 
 /// how often (and how long) to poll the host state file for the daemon's
-/// mirror of a just-created remote object, before giving up on focusing it
-const MIRROR_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// mirror of a just-created remote object, before giving up on focusing it.
+/// Kept short: this is on the hot path between keypress and split appearing.
+const MIRROR_POLL_INTERVAL: Duration = Duration::from_millis(15);
 const MIRROR_POLL_TIMEOUT: Duration = Duration::from_millis(4000);
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
 struct InvocationContext {
     workspace_id: Option<String>,
     focused_pane_id: Option<String>,
+}
+
+/// Build the invocation context, preferring the plugin-invoke JSON blob
+/// (`HERDR_PLUGIN_CONTEXT_JSON`, set by `herdr plugin action invoke`) and
+/// falling back to the `HERDR_ACTIVE_WORKSPACE_ID` / `HERDR_ACTIVE_PANE_ID`
+/// env vars herdr injects into a keybinding's custom-command shell. The
+/// fallback is what lets a keybinding exec this binary directly (skipping
+/// the socket round-trip + plugin-process spawn of `action invoke`) while
+/// still resolving the same workspace/pane context.
+///
+/// Takes its inputs as plain arguments rather than reading `std::env`
+/// itself so tests can exercise the fallback without mutating real process
+/// env vars (which would race across parallel tests).
+fn context_from_env(
+    plugin_context_json: Option<String>,
+    active_workspace_id: Option<String>,
+    active_pane_id: Option<String>,
+) -> InvocationContext {
+    let mut ctx: InvocationContext = plugin_context_json
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    if ctx.workspace_id.is_none() {
+        ctx.workspace_id = active_workspace_id.filter(|s| !s.is_empty());
+    }
+    if ctx.focused_pane_id.is_none() {
+        ctx.focused_pane_id = active_pane_id.filter(|s| !s.is_empty());
+    }
+    ctx
 }
 
 struct Resolved {
@@ -73,10 +102,11 @@ pub async fn run(env: Env, kind: &str, direction: Option<&str>) -> Result<()> {
         return Err(err("remote-split needs a direction: right|down"));
     }
 
-    let ctx: InvocationContext = std::env::var("HERDR_PLUGIN_CONTEXT_JSON")
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let ctx = context_from_env(
+        std::env::var("HERDR_PLUGIN_CONTEXT_JSON").ok(),
+        std::env::var("HERDR_ACTIVE_WORKSPACE_ID").ok(),
+        std::env::var("HERDR_ACTIVE_PANE_ID").ok(),
+    );
     let config = load_config(&env.config_dir)?;
     let resolved = resolve_context(&env, &config.hosts, &ctx);
 
@@ -333,6 +363,90 @@ mod tests {
         let r2 = resolve_context(&env, &hosts, &ctx2).expect("resolves");
         assert_eq!(r2.remote_pane_id.as_deref(), Some("wR:pR2"));
         assert_eq!(r2.remote_pane_cwd, None);
+
+        std::fs::remove_dir_all(&env.state_dir).ok();
+    }
+
+    /// context_from_env prefers a complete plugin-invoke JSON blob; when it's
+    /// absent, unparsable, or present-but-empty, it falls back to the
+    /// HERDR_ACTIVE_WORKSPACE_ID / HERDR_ACTIVE_PANE_ID values herdr injects
+    /// into a keybinding's custom-command shell — the mechanism that lets a
+    /// keybinding exec this binary directly instead of going through
+    /// `herdr plugin action invoke`.
+    #[test]
+    fn context_from_env_falls_back_to_active_env_vars() {
+        // complete plugin JSON: used as-is, env fallback never consulted
+        let ctx = context_from_env(
+            Some(r#"{"workspace_id":"wJ","focused_pane_id":"pJ"}"#.into()),
+            Some("wEnv".into()),
+            Some("pEnv".into()),
+        );
+        assert_eq!(ctx, InvocationContext {
+            workspace_id: Some("wJ".into()),
+            focused_pane_id: Some("pJ".into()),
+        });
+
+        // no plugin JSON at all (direct binary exec): fall back fully to env
+        let ctx = context_from_env(None, Some("wEnv".into()), Some("pEnv".into()));
+        assert_eq!(ctx, InvocationContext {
+            workspace_id: Some("wEnv".into()),
+            focused_pane_id: Some("pEnv".into()),
+        });
+
+        // plugin JSON present but an empty object: still falls back
+        let ctx = context_from_env(Some("{}".into()), Some("wEnv".into()), Some("pEnv".into()));
+        assert_eq!(ctx, InvocationContext {
+            workspace_id: Some("wEnv".into()),
+            focused_pane_id: Some("pEnv".into()),
+        });
+
+        // plugin JSON unparsable garbage: treated like absent, falls back
+        let ctx = context_from_env(Some("not json".into()), Some("wEnv".into()), Some("pEnv".into()));
+        assert_eq!(ctx, InvocationContext {
+            workspace_id: Some("wEnv".into()),
+            focused_pane_id: Some("pEnv".into()),
+        });
+
+        // neither source present: stays empty, exactly like today's
+        // outside-a-mirror-workspace behavior
+        let ctx = context_from_env(None, None, None);
+        assert_eq!(ctx, InvocationContext::default());
+
+        // env vars present but empty strings count as absent, not as ids
+        let ctx = context_from_env(None, Some(String::new()), Some(String::new()));
+        assert_eq!(ctx, InvocationContext::default());
+    }
+
+    /// End-to-end: a context built purely from the HERDR_ACTIVE_* env-var
+    /// fallback (as a keybinding execing the plugin binary directly would
+    /// produce, with no HERDR_PLUGIN_CONTEXT_JSON at all) still resolves to
+    /// the right host/pane through resolve_context — the direct-exec path
+    /// reaches the same resolution logic as the plugin action invoke path.
+    #[test]
+    fn resolve_context_works_with_env_fallback_context() {
+        let env = tmp_env();
+        let mut state = HostState::default();
+        state.workspaces.insert(
+            "wR".into(),
+            WsEntry { local_id: "wL".into(), tombstone: None, root_tab_local_id: None, last_remote_label: None },
+        );
+        state.panes.insert(
+            "wR:pR".into(),
+            PaneEntry {
+                local_id: "wL:pL".into(),
+                tombstone: None,
+                seq: 0,
+                reported: None,
+                cwd: Some("/remote/work/dir".into()),
+            },
+        );
+        save_state(&env.state_dir, "h1", &state).unwrap();
+
+        let hosts = vec![host("h1")];
+        let ctx = context_from_env(None, Some("wL".into()), Some("wL:pL".into()));
+        let r = resolve_context(&env, &hosts, &ctx).expect("resolves");
+        assert_eq!(r.remote_pane_id.as_deref(), Some("wR:pR"));
+        assert_eq!(r.remote_pane_cwd.as_deref(), Some("/remote/work/dir"));
 
         std::fs::remove_dir_all(&env.state_dir).ok();
     }
