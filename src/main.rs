@@ -13,6 +13,7 @@ mod daemon;
 mod foreground;
 mod grid;
 mod mirror;
+mod mux;
 mod pane;
 mod predict;
 mod protocol;
@@ -81,6 +82,8 @@ fn run_on(rt: &tokio::runtime::Runtime, cmd: &str, rest: &[String]) -> Result<()
             let args = agent::parse_args(&rest[1..])?;
             rt.block_on(agent::run(args))
         }
+        // hidden: single-host mux for integration tests (daemon calls mux::spawn)
+        "mux" => rt.block_on(mux::run_cli(&rest[1..])),
         "remote-workspace" => rt.block_on(remote_action::run(Env::resolve()?, "workspace", None)),
         "remote-tab" => rt.block_on(remote_action::run(Env::resolve()?, "tab", None)),
         "remote-split" => rt.block_on(remote_action::run(

@@ -446,6 +446,11 @@ pub async fn cmd_run(env: Env) -> Result<()> {
         };
         tasks.push(tokio::spawn(host_task(ctx, rx)));
     }
+    // Single-connection mux: one per host, running alongside the legacy
+    // per-pane/ControlMaster data plane (nothing connects to it yet — phase 2).
+    let muxes: Vec<crate::mux::MuxHandle> =
+        config.hosts.iter().map(|h| crate::mux::spawn(h, &env.state_dir)).collect();
+
     let prefixes: Vec<String> = config.hosts.iter().map(|h| h.prefix.clone()).collect();
     tasks.push(tokio::spawn(local_events_task(
         local.clone(),
@@ -485,6 +490,11 @@ pub async fn cmd_run(env: Env) -> Result<()> {
     // stop sync work first, or a live host task could re-report after the clear
     for t in &tasks {
         t.abort();
+    }
+    // tear down each host mux: stops reconnects and kills the ssh child so the
+    // remote agent (and its terminal children) exit rather than leaking
+    for m in &muxes {
+        m.shutdown();
     }
     for h in &config.hosts {
         let state = load_state(&env.state_dir, &h.name);

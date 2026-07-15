@@ -13,6 +13,10 @@ pub struct HostConfig {
     pub target: String,
     pub prefix: String,
     pub remote_bin: String,
+    /// Remote path of the mux agent binary (`herdr-mirror agent`). `None` means
+    /// the mux default (`~/.local/libexec/herdr-mirror`). Used only by the
+    /// single-connection mux; the legacy per-pane transport ignores it.
+    pub agent_bin: Option<String>,
     /// keep each mirror pane in control (writable, no idle release, and sized to
     /// the local pane so it fills). Default on; ideal for headless remotes. Turn
     /// off per host for a remote a human is actively using directly.
@@ -61,6 +65,7 @@ struct RawHost {
     target: String,
     prefix: Option<String>,
     remote_bin: Option<String>,
+    agent_bin: Option<String>,
     enabled: Option<bool>,
     always_control: Option<bool>,
 }
@@ -88,6 +93,7 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
         hosts.push(HostConfig {
             prefix: h.prefix.unwrap_or_else(|| name.clone()),
             remote_bin: h.remote_bin.unwrap_or_else(|| "~/.local/bin/herdr".into()),
+            agent_bin: h.agent_bin,
             always_control: h.always_control.unwrap_or(global_always_control),
             target: h.target,
             name,
@@ -124,7 +130,21 @@ mod tests {
         assert_eq!(h.name, "work");
         assert_eq!(h.prefix, "work");
         assert_eq!(h.remote_bin, "~/.local/bin/herdr");
+        assert_eq!(h.agent_bin, None); // mux applies its own default
         assert!(h.always_control); // default on
+    }
+
+    #[test]
+    fn agent_bin_optional_override() {
+        let c = parse_config(
+            "[hosts.a]\ntarget = \"a\"\n\
+             [hosts.b]\ntarget = \"b\"\nagent_bin = \"/opt/herdr-mirror\"\n",
+        )
+        .unwrap();
+        let a = c.hosts.iter().find(|h| h.name == "a").unwrap();
+        let b = c.hosts.iter().find(|h| h.name == "b").unwrap();
+        assert_eq!(a.agent_bin, None);
+        assert_eq!(b.agent_bin.as_deref(), Some("/opt/herdr-mirror"));
     }
 
     #[test]

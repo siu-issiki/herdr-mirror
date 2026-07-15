@@ -256,6 +256,7 @@ mod tests {
             target: "user@host".into(),
             prefix: "h".into(),
             remote_bin: "herdr".into(),
+            agent_bin: None,
             always_control: true,
         }
     }
