@@ -15,6 +15,98 @@ pub fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()))
 }
 
+/// The fixed state dir shared by daemon, actions, and pane wrappers. Kept a
+/// single canonical path (never the plugin dir) so every invocation agrees on
+/// the id map, pidfile, and the optimistic split claim/adopt files.
+pub fn default_state_dir() -> PathBuf {
+    home_dir().join(".local").join("state").join("herdr-mirror")
+}
+
+// ---------------------------------------------------------------------------
+// optimistic local split: claim + adopt handoff files
+//
+// The remote-split action creates the local pane FIRST (optimistic), execs a
+// pane wrapper in `--pending` mode, then splits the remote pane in the
+// background. Two tiny files carry the handoff:
+//
+//   claim-<local_pane_id>.json   action → pending wrapper: which remote pane to
+//                                stream ({"pane":"<rid>"}), or a failure
+//                                ({"error":"…"}) so the wrapper self-closes.
+//   adopt/<host>/<remote_pane_id> action → daemon: the local pane id that
+//                                already mirrors this remote pane, so converge
+//                                maps onto it instead of creating a new one.
+
+/// `<state_dir>/claim-<local_pane_id>.json`
+pub fn claim_path(state_dir: &Path, local_pane_id: &str) -> PathBuf {
+    state_dir.join(format!("claim-{local_pane_id}.json"))
+}
+
+/// `<state_dir>/adopt/<host>/<remote_pane_id>`
+pub fn adopt_path(state_dir: &Path, host: &str, remote_pane_id: &str) -> PathBuf {
+    state_dir.join("adopt").join(host).join(remote_pane_id)
+}
+
+/// Parsed contents of a claim file.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Claim {
+    /// stream this remote pane
+    Pane(String),
+    /// the remote split failed; the wrapper should surface it and exit
+    Error(String),
+    /// unreadable / half-written / unrecognized — caller keeps polling
+    Invalid,
+}
+
+/// Classify a claim file's JSON body. Unknown/garbage is `Invalid` (not an
+/// error) so a reader that raced a half-written file just polls again.
+pub fn parse_claim(s: &str) -> Claim {
+    match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(v) => {
+            if let Some(p) = v.get("pane").and_then(|x| x.as_str()).filter(|p| !p.is_empty()) {
+                Claim::Pane(p.to_string())
+            } else if let Some(e) = v.get("error").and_then(|x| x.as_str()) {
+                Claim::Error(e.to_string())
+            } else {
+                Claim::Invalid
+            }
+        }
+        Err(_) => Claim::Invalid,
+    }
+}
+
+/// `{"pane":"<remote_pane_id>"}`
+pub fn claim_json_pane(remote_pane_id: &str) -> String {
+    serde_json::json!({ "pane": remote_pane_id }).to_string()
+}
+
+/// `{"error":"<msg>"}`
+pub fn claim_json_error(msg: &str) -> String {
+    serde_json::json!({ "error": msg }).to_string()
+}
+
+/// Write via a sibling `.tmp` + rename so a reader never observes a partial
+/// file. Creates parent dirs.
+pub fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, contents)?;
+    fs::rename(&tmp, path)
+}
+
+/// Is `path` older than `max_age`? False if it can't be stat'd. Used to sweep
+/// stale claim/adopt files a converge left behind (self-healing).
+pub fn older_than(path: &Path, max_age: std::time::Duration) -> bool {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+        .is_some_and(|age| age > max_age)
+}
+
 /// Resolved runtime environment. Config prefers the plugin dir if hosts.toml
 /// lives there; state is ALWAYS the fixed path so shell and plugin-action
 /// invocations share one id map and pidfile.
@@ -50,7 +142,7 @@ impl Env {
             Ok(dir) if Path::new(&dir).join("hosts.toml").exists() => PathBuf::from(dir),
             _ => fallback_config,
         };
-        let state_dir = home_dir().join(".local").join("state").join("herdr-mirror");
+        let state_dir = default_state_dir();
         fs::create_dir_all(&config_dir)?;
         fs::create_dir_all(&state_dir)?;
         let local_socket = match std::env::var("HERDR_SOCKET_PATH") {
@@ -150,5 +242,65 @@ where
     match deadlines.into_iter().flatten().min() {
         Some(d) => tokio::time::sleep_until(d).await,
         None => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claim_and_adopt_paths() {
+        let sd = Path::new("/state");
+        assert_eq!(claim_path(sd, "w1:p2"), PathBuf::from("/state/claim-w1:p2.json"));
+        assert_eq!(adopt_path(sd, "work", "wR:pR"), PathBuf::from("/state/adopt/work/wR:pR"));
+    }
+
+    #[test]
+    fn claim_serialize_roundtrips_through_parse() {
+        assert_eq!(parse_claim(&claim_json_pane("wR:pR")), Claim::Pane("wR:pR".into()));
+        assert_eq!(parse_claim(&claim_json_error("boom")), Claim::Error("boom".into()));
+    }
+
+    #[test]
+    fn parse_claim_classifies_bodies() {
+        assert_eq!(parse_claim(r#"{"pane":"wR:pR"}"#), Claim::Pane("wR:pR".into()));
+        assert_eq!(parse_claim(r#"{"error":"remote split failed"}"#), Claim::Error("remote split failed".into()));
+        // an empty pane string is not a usable claim
+        assert_eq!(parse_claim(r#"{"pane":""}"#), Claim::Invalid);
+        // unknown keys / empty object / half-written garbage → keep polling
+        assert_eq!(parse_claim("{}"), Claim::Invalid);
+        assert_eq!(parse_claim(r#"{"other":1}"#), Claim::Invalid);
+        assert_eq!(parse_claim(r#"{"pane":"#), Claim::Invalid);
+        assert_eq!(parse_claim(""), Claim::Invalid);
+    }
+
+    #[test]
+    fn write_atomic_creates_parents_and_leaves_no_tmp() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-util-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let target = dir.join("adopt").join("work").join("wR:pR");
+        write_atomic(&target, "w9:p1").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "w9:p1");
+        // the sibling temp file must be gone after the rename
+        let mut tmp = target.as_os_str().to_os_string();
+        tmp.push(".tmp");
+        assert!(!PathBuf::from(tmp).exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn older_than_reads_mtime() {
+        let dir = std::env::temp_dir().join(format!("herdr-util-age-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("fresh");
+        fs::write(&f, "x").unwrap();
+        assert!(!older_than(&f, std::time::Duration::from_secs(60)));
+        // a nonexistent file is never "old" (can't be stat'd)
+        assert!(!older_than(&dir.join("missing"), std::time::Duration::from_secs(0)));
+        fs::remove_dir_all(&dir).ok();
     }
 }

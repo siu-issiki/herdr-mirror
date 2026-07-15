@@ -25,7 +25,7 @@ use crate::api::ApiClient;
 use crate::config::{load_config, HostConfig};
 use crate::remote::RemoteHost;
 use crate::state::{load_state, HostState};
-use crate::util::{err, Env, Result};
+use crate::util::{err, Env, Logger, Result};
 
 /// how often (and how long) to poll the host state file for the daemon's
 /// mirror of a just-created remote object, before giving up on focusing it.
@@ -151,6 +151,34 @@ pub async fn run(env: Env, kind: &str, direction: Option<&str>) -> Result<()> {
                     .map(String::from)
                     .or_else(|| res.pointer("/pane/cwd").and_then(|v| v.as_str()).map(String::from));
             }
+        }
+    }
+
+    // Optimistic local split (the cmd+d hot path): create and focus the LOCAL
+    // mirror pane FIRST (~50ms), exec a pending wrapper into it, then split the
+    // remote pane in the background and hand the new remote pane id to both the
+    // wrapper (claim file → start streaming) and the daemon (adopt file → map
+    // onto the existing pane instead of creating another). Only `split` is
+    // optimistic; remote-tab / remote-workspace keep the legacy path below. If
+    // the local side can't be set up, we fall through to the legacy remote-first
+    // split so the feature never makes cmd+d worse than before.
+    if kind == "split" {
+        let dir = direction.unwrap();
+        let remote_pane_id = resolved.as_ref().and_then(|r| r.remote_pane_id.clone());
+        let remote_ws_id = resolved.as_ref().and_then(|r| r.remote_ws_id.clone());
+        let local_target = ctx.focused_pane_id.clone();
+        if let (Some(remote_pane_id), Some(remote_ws_id), Some(local_target)) =
+            (remote_pane_id, remote_ws_id, local_target)
+        {
+            if let Some(new_local_id) =
+                optimistic_local_split(&env, &host, &local_target, &remote_ws_id, dir).await
+            {
+                return finish_optimistic_split(
+                    &env, &host, &api, &remote_pane_id, &new_local_id, dir, cwd,
+                )
+                .await;
+            }
+            // local setup failed → fall through to the legacy remote-first path
         }
     }
 
@@ -282,6 +310,95 @@ async fn focus_new_mirror(env: &Env, host: &str, kind: &str, remote_id: &str) {
     };
     if let Err(e) = result {
         println!("mirror focus failed: {e}");
+    }
+}
+
+/// Optimistic split, local half: create the mirror pane next to the focused
+/// one and exec a pending wrapper into it. Returns the new local pane id, or
+/// None if the local herdr couldn't be reached or the split failed (caller
+/// falls back to the legacy remote-first path). Best-effort by design.
+async fn optimistic_local_split(
+    env: &Env,
+    host: &HostConfig,
+    local_target: &str,
+    remote_ws_id: &str,
+    dir: &str,
+) -> Option<String> {
+    let local = ApiClient::connect(&env.local_socket).await.ok()?;
+    // the per-workspace mirror proxy cwd tags the new pane as a mirror, so the
+    // daemon's loop guard won't try to push it back to the remote
+    let cwd = crate::mirror::ensure_ws_cwd(&env.state_dir, &host.name, remote_ws_id);
+    let res = local
+        .request(
+            "pane.split",
+            json!({ "target_pane_id": local_target, "direction": dir, "cwd": cwd, "focus": true }),
+        )
+        .await
+        .ok()?;
+    let new_local_id = res.pointer("/pane/pane_id").and_then(|v| v.as_str())?.to_string();
+    // same wrapper the daemon would spawn, but in --pending mode with no pane
+    // target yet — it waits on the claim file we write once the remote lands
+    let argv = crate::mirror::pending_streamer_argv(host, &env.state_dir);
+    crate::mirror::spawn_streamer_pane(&local, &new_local_id, &argv, &Logger::new(&env.state_dir, false)).await;
+    Some(new_local_id)
+}
+
+/// Optimistic split, remote half + handoff: split the remote pane, then write
+/// the adopt file (daemon: map onto the existing local pane) BEFORE the claim
+/// file (wrapper: start streaming this remote pane). On remote failure, write
+/// an error claim so the pending wrapper surfaces it and self-closes.
+async fn finish_optimistic_split(
+    env: &Env,
+    host: &HostConfig,
+    api: &ApiClient,
+    remote_pane_id: &str,
+    new_local_id: &str,
+    dir: &str,
+    cwd: Option<String>,
+) -> Result<()> {
+    match api
+        .request(
+            "pane.split",
+            json!({ "target_pane_id": remote_pane_id, "direction": dir, "cwd": cwd, "focus": false }),
+        )
+        .await
+    {
+        Ok(res) => {
+            let new_remote_id =
+                res.pointer("/pane/pane_id").and_then(|v| v.as_str()).map(String::from).filter(|s| !s.is_empty());
+            let Some(new_remote_id) = new_remote_id else {
+                write_claim(env, new_local_id, &crate::util::claim_json_error("remote split returned no pane id"));
+                return Err(err("remote split returned no pane id"));
+            };
+            // adopt BEFORE claim: the daemon's converge (driven by the remote
+            // pane_created event) must see the adopt marker to map rather than
+            // create; the wrapper's claim only makes it start streaming.
+            let adopt = crate::util::adopt_path(&env.state_dir, &host.name, &new_remote_id);
+            if let Err(e) = crate::util::write_atomic(&adopt, new_local_id) {
+                // non-fatal: without adopt the daemon may create a second pane
+                // and the wrapper takes it over via --takeover; still works.
+                eprintln!("optimistic split: adopt write failed: {e}");
+            }
+            write_claim(env, new_local_id, &crate::util::claim_json_pane(&new_remote_id));
+            println!(
+                "split {remote_pane_id} {dir} on {} → {new_remote_id} (optimistic; local {new_local_id})",
+                host.name
+            );
+            Ok(())
+        }
+        Err(e) => {
+            write_claim(env, new_local_id, &crate::util::claim_json_error(&e.to_string()));
+            Err(e)
+        }
+    }
+}
+
+/// Write a pending pane's claim file (best-effort; a failure just means the
+/// wrapper eventually times out and self-closes).
+fn write_claim(env: &Env, local_pane_id: &str, body: &str) {
+    let path = crate::util::claim_path(&env.state_dir, local_pane_id);
+    if let Err(e) = crate::util::write_atomic(&path, body) {
+        eprintln!("optimistic split: claim write failed: {e}");
     }
 }
 

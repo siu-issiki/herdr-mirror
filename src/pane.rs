@@ -71,6 +71,11 @@ pub struct Args {
     /// can't be reached (mux not up yet) it falls back to the ssh path below, and
     /// retries the mux on the next (re)connect. None → ssh transport only.
     pub mux_sock: Option<String>,
+    /// optimistic-split pending mode: started before the remote pane exists, with
+    /// no pane-target positional. The wrapper shows "connecting…" and polls its
+    /// claim file (`claim-<HERDR_PANE_ID>.json`) for the remote pane id (or an
+    /// error) before entering the normal connect flow.
+    pub pending: bool,
 }
 
 pub fn parse_args(argv: &[String]) -> Result<Args> {
@@ -86,6 +91,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
         always_control: false,
         ctl_path: None,
         mux_sock: None,
+        pending: false,
     };
     let mut positional: Vec<String> = Vec::new();
     let mut it = argv.iter();
@@ -109,19 +115,68 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
             "--always-control" => args.always_control = true,
             "--ctl-path" => args.ctl_path = Some(next("--ctl-path")?),
             "--mux-sock" => args.mux_sock = Some(next("--mux-sock")?),
+            "--pending" => args.pending = true,
             "--dump" => args.dump = true,
             other if other.starts_with('-') => return Err(err(format!("unknown option: {other}"))),
             other => positional.push(other.to_string()),
         }
     }
-    if positional.len() != 2 {
-        return Err(err(
-            "usage: herdr-mirror pane <ssh-target> <pane-target> [--remote-bin PATH] [--cols N --rows N] [--dump]",
-        ));
+    // --pending starts before the remote pane exists, so it carries only the
+    // ssh-target; the pane-target is filled in later from the claim file.
+    if args.pending {
+        if positional.len() != 1 {
+            return Err(err(
+                "usage: herdr-mirror pane <ssh-target> --pending [options] (no pane-target)",
+            ));
+        }
+        args.ssh_target = positional.remove(0);
+    } else {
+        if positional.len() != 2 {
+            return Err(err(
+                "usage: herdr-mirror pane <ssh-target> <pane-target> [--remote-bin PATH] [--cols N --rows N] [--dump]",
+            ));
+        }
+        args.ssh_target = positional.remove(0);
+        args.pane_target = positional.remove(0);
     }
-    args.ssh_target = positional.remove(0);
-    args.pane_target = positional.remove(0);
     Ok(args)
+}
+
+/// Poll this pending pane's claim file for the remote pane id the action is
+/// splitting for us, or a failure. Returns `Ok(remote_pane_id)` on a `pane`
+/// claim, `Err(msg)` on an `error` claim or timeout. Pure-ish: the state dir
+/// and self pane id are passed in so it's testable without process env.
+async fn await_claim(
+    state_dir: &std::path::Path,
+    self_pane_id: &str,
+    poll_interval: Duration,
+    timeout: Duration,
+) -> std::result::Result<String, String> {
+    if self_pane_id.is_empty() {
+        return Err("HERDR_PANE_ID not set — cannot resolve the pending split".into());
+    }
+    let path = crate::util::claim_path(state_dir, self_pane_id);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(body) = std::fs::read_to_string(&path) {
+            match crate::util::parse_claim(&body) {
+                crate::util::Claim::Pane(rid) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Ok(rid);
+                }
+                crate::util::Claim::Error(msg) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(msg);
+                }
+                // half-written / not-yet-meaningful: keep polling, leave the file
+                crate::util::Claim::Invalid => {}
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("timed out waiting for the remote split".into());
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -514,6 +569,11 @@ const QUICK_CONTROL_FAILURE: Duration = Duration::from_secs(4);
 /// fallback. Slow enough that a repeatedly-refused control session can't spin
 /// (each retry still needs 2 quick failures to fall back again).
 const CONTROL_RETRY_INTERVAL: Duration = Duration::from_secs(20);
+
+/// optimistic-split pending mode: how often, and how long, to poll the claim
+/// file for the remote pane id the action is creating for us.
+const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(30);
+const PENDING_TIMEOUT: Duration = Duration::from_secs(8);
 
 struct App {
     args: Args,
@@ -1181,6 +1241,37 @@ pub async fn run(args: Args) -> Result<()> {
         mux_tx: None,
         mux_api_sid: 0,
     };
+
+    // optimistic-split pending mode: the remote pane doesn't exist yet. Show a
+    // "connecting…" placeholder while the remote-split action resolves the
+    // remote pane id into our claim file, then adopt it as the pane target. A
+    // failure or timeout paints the reason briefly, then we exit so the pane
+    // closes on its own.
+    if app.args.pending {
+        app.renderer.status("connecting…");
+        app.paint();
+        let self_pane_id = std::env::var("HERDR_PANE_ID").unwrap_or_default();
+        let state_dir = crate::util::default_state_dir();
+        match await_claim(&state_dir, &self_pane_id, PENDING_POLL_INTERVAL, PENDING_TIMEOUT).await {
+            Ok(remote_pane) => {
+                app.args.pane_target = remote_pane;
+                app.args.pending = false;
+            }
+            Err(msg) => {
+                app.renderer.status(&format!("split failed: {msg}"));
+                app.paint();
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if tty {
+                    write_stdout("\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l");
+                }
+                if let Some(raw) = raw {
+                    raw.restore();
+                }
+                return Ok(());
+            }
+        }
+    }
+
     app.connect(if app.args.always_control { Mode::Control } else { Mode::Observe }).await;
 
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -1364,6 +1455,56 @@ mod tests {
         assert!(a.mux_sock.is_none());
         assert!(parse_args(&["onlyone".to_string()]).is_err());
         assert!(parse_args(&["a".into(), "b".into(), "--visibility-file".into(), "x".into()]).is_err());
+    }
+
+    #[test]
+    fn arg_parsing_pending_allows_no_pane_target() {
+        // --pending: only the ssh-target positional, pane-target resolved later
+        let argv: Vec<String> = ["work", "--pending", "--mux-sock", "/tmp/m.sock", "--always-control"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let a = parse_args(&argv).unwrap();
+        assert!(a.pending);
+        assert_eq!(a.ssh_target, "work");
+        assert_eq!(a.pane_target, "");
+        assert!(a.always_control);
+        assert_eq!(a.mux_sock.as_deref(), Some("/tmp/m.sock"));
+        // a pane-target alongside --pending is rejected (2 positionals)
+        assert!(parse_args(&["work".into(), "w9:p1".into(), "--pending".into()]).is_err());
+        // and --pending still needs the ssh-target (0 positionals is an error)
+        assert!(parse_args(&["--pending".into()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn await_claim_resolves_pane_then_error_then_timeout() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-await-claim-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // pane claim → Ok(remote id), and the claim file is consumed
+        let claim = crate::util::claim_path(&dir, "w9:p1");
+        crate::util::write_atomic(&claim, &crate::util::claim_json_pane("wR:pR")).unwrap();
+        let got = await_claim(&dir, "w9:p1", Duration::from_millis(5), Duration::from_secs(1)).await;
+        assert_eq!(got.as_deref(), Ok("wR:pR"));
+        assert!(!claim.exists());
+
+        // error claim → Err(msg)
+        crate::util::write_atomic(&claim, &crate::util::claim_json_error("remote split failed")).unwrap();
+        let got = await_claim(&dir, "w9:p1", Duration::from_millis(5), Duration::from_secs(1)).await;
+        assert_eq!(got, Err("remote split failed".to_string()));
+
+        // no claim → times out
+        let got = await_claim(&dir, "w9:p2", Duration::from_millis(5), Duration::from_millis(40)).await;
+        assert!(got.is_err());
+
+        // no self pane id → immediate error
+        assert!(await_claim(&dir, "", Duration::from_millis(5), Duration::from_secs(1)).await.is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -7,7 +7,7 @@
 // (close the mirror).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -275,36 +275,54 @@ pub struct ConvergeDeps {
     pub close_remote_on_local_close: bool,
 }
 
-/// argv for one mirror pane: this same binary in `pane` mode. Panes without a
-/// known size get no --cols/--rows (the wrapper falls back to a default).
-fn cmd_for_pane(deps: &ConvergeDeps, sizes: &HashMap<String, LayoutRect>) -> impl Fn(&str) -> Vec<String> {
+/// Shared prefix of a mirror pane's argv: this same binary in `pane` mode,
+/// carrying the host's ssh target, remote bin, control policy, and the ctl /
+/// mux sockets — everything EXCEPT the pane-target positional and the observe
+/// size. The daemon appends the pane target (`cmd_for_pane`); the optimistic
+/// remote-split action appends `--pending` instead (`pending_streamer_argv`),
+/// so both spawn the exact same wrapper with the same transport wiring.
+pub fn streamer_argv_base(host: &HostConfig, state_dir: &Path) -> Vec<String> {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "herdr-mirror".into());
-    let target = deps.host.target.clone();
-    let remote_bin = deps.host.remote_bin.clone();
-    let always_control = deps.host.always_control;
     // daemon's ControlMaster socket for this host (see remote.rs); the streamer
     // reuses it for cheap foreground polls
-    let ctl_path = deps.state_dir.join(format!("{}.ctl", deps.host.name)).display().to_string();
+    let ctl_path = state_dir.join(format!("{}.ctl", host.name)).display().to_string();
     // host's single mux socket; the streamer prefers it and falls back to the
     // ssh path (via --ctl-path) when it isn't reachable yet at startup.
-    let mux_sock = crate::mux::sock_path(&deps.state_dir, &deps.host.name).display().to_string();
+    let mux_sock = crate::mux::sock_path(state_dir, &host.name).display().to_string();
+    let mut argv = vec![
+        exe,
+        "pane".into(),
+        host.target.clone(),
+        "--remote-bin".into(),
+        host.remote_bin.clone(),
+    ];
+    if host.always_control {
+        argv.push("--always-control".into());
+    }
+    argv.extend(["--ctl-path".into(), ctl_path]);
+    argv.extend(["--mux-sock".into(), mux_sock]);
+    argv
+}
+
+/// argv for a pending (optimistic-split) wrapper: the shared base plus
+/// `--pending`, with no pane target — the wrapper resolves it from its claim
+/// file once the background remote split lands.
+pub fn pending_streamer_argv(host: &HostConfig, state_dir: &Path) -> Vec<String> {
+    let mut argv = streamer_argv_base(host, state_dir);
+    argv.push("--pending".into());
+    argv
+}
+
+/// argv for one mirror pane: this same binary in `pane` mode. Panes without a
+/// known size get no --cols/--rows (the wrapper falls back to a default).
+fn cmd_for_pane(deps: &ConvergeDeps, sizes: &HashMap<String, LayoutRect>) -> impl Fn(&str) -> Vec<String> {
+    let base = streamer_argv_base(&deps.host, &deps.state_dir);
     let sizes = sizes.clone();
     move |pane_id: &str| {
-        let mut argv = vec![
-            exe.clone(),
-            "pane".into(),
-            target.clone(),
-            pane_id.to_string(),
-            "--remote-bin".into(),
-            remote_bin.clone(),
-        ];
-        if always_control {
-            argv.push("--always-control".into());
-        }
-        argv.extend(["--ctl-path".into(), ctl_path.clone()]);
-        argv.extend(["--mux-sock".into(), mux_sock.clone()]);
+        let mut argv = base.clone();
+        argv.push(pane_id.to_string());
         if let Some(rect) = sizes.get(pane_id) {
             argv.extend([
                 "--cols".into(),
@@ -326,7 +344,7 @@ fn sh_quote(s: &str) -> String {
 /// layout `command`), which set `launch_argv` and would surface every mirror pane
 /// as an agent row; a shell `exec` keeps it non-agent until a real agent is
 /// reported onto it.
-async fn spawn_streamer_pane(local: &ApiClient, local_pane_id: &str, argv: &[String], log: &Logger) {
+pub async fn spawn_streamer_pane(local: &ApiClient, local_pane_id: &str, argv: &[String], log: &Logger) {
     let line = format!(
         "exec {}\n",
         argv.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" ")
@@ -358,10 +376,76 @@ fn mirror_ws_cwd(state_dir: &std::path::Path, host: &str, remote_ws_id: &str) ->
 
 /// The per-workspace proxy cwd as a string, ensuring the directory exists so a
 /// pane can be created with it as cwd without racing the git-HEAD writer.
-fn ensure_ws_cwd(state_dir: &std::path::Path, host: &str, remote_ws_id: &str) -> String {
+pub fn ensure_ws_cwd(state_dir: &std::path::Path, host: &str, remote_ws_id: &str) -> String {
     let p = mirror_ws_cwd(state_dir, host, remote_ws_id);
     let _ = std::fs::create_dir_all(&p);
     p.display().to_string()
+}
+
+/// Optimistic-split adoption: if the remote-split action already created a
+/// local pane for `remote_pane_id` (recorded in its adopt file) and that pane
+/// is still present in the local snapshot, return its id so converge maps onto
+/// it instead of creating a fresh mirror pane. The adopt file is consumed
+/// either way (a stale/missing local pane just falls back to normal creation).
+fn try_adopt_local_pane(
+    state_dir: &Path,
+    host: &str,
+    remote_pane_id: &str,
+    local_pane_ids: &HashSet<&str>,
+    log: &Logger,
+) -> Option<String> {
+    let path = crate::util::adopt_path(state_dir, host, remote_pane_id);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    let local_id = raw.trim();
+    if local_id.is_empty() {
+        return None;
+    }
+    if local_pane_ids.contains(local_id) {
+        log.log(&format!(
+            "adopting optimistic local pane {local_id} for remote {remote_pane_id} (no new pane, no streamer inject)"
+        ));
+        Some(local_id.to_string())
+    } else {
+        log.log(&format!(
+            "optimistic adopt for {remote_pane_id}: local pane {local_id} not present — creating normally"
+        ));
+        None
+    }
+}
+
+/// Age past which a claim/adopt file is considered orphaned (the action died
+/// before writing it, or the daemon already created the pane the normal way).
+const OPTIMISTIC_FILE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Best-effort sweep of orphaned optimistic-split handoff files: `claim-*.json`
+/// in the state dir and `adopt/<host>/<rid>` files, both older than 60s. Keeps
+/// the degraded-race case (daemon created the pane before the adopt was read)
+/// self-healing without leaking files.
+fn sweep_stale_optimistic_files(state_dir: &Path) {
+    if let Ok(rd) = std::fs::read_dir(state_dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let is_claim = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("claim-") && n.ends_with(".json"));
+            if is_claim && crate::util::older_than(&p, OPTIMISTIC_FILE_TTL) {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+    if let Ok(hosts) = std::fs::read_dir(state_dir.join("adopt")) {
+        for h in hosts.flatten() {
+            if let Ok(files) = std::fs::read_dir(h.path()) {
+                for f in files.flatten() {
+                    if crate::util::older_than(&f.path(), OPTIMISTIC_FILE_TTL) {
+                        let _ = std::fs::remove_file(f.path());
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Remove a mirror workspace's proxy directory (git repo included) when its
@@ -619,6 +703,8 @@ async fn converge_inner(
     }
     let cmd_for = cmd_for_pane(deps, &sizes);
     let _ = std::fs::create_dir_all(mirror_pane_cwd(&deps.state_dir));
+    // reap any optimistic-split handoff files a prior action/converge orphaned
+    sweep_stale_optimistic_files(&deps.state_dir);
 
     // 1. detect mirrors the user closed locally. Always tombstone (never remove)
     //    so this pass can't recreate them (the snapshot still lists the object).
@@ -948,6 +1034,19 @@ async fn converge_inner(
                 let cwd = ensure_ws_cwd(&deps.state_dir, &host.name, &rtab.workspace_id);
                 for rp in &remote_panes_in_tab {
                     if state.panes.contains_key(&rp.pane_id) {
+                        continue;
+                    }
+                    // optimistic-split fast path: the remote-split action may have
+                    // already created the local pane and exec'd a pending wrapper
+                    // into it. If so, map onto that existing pane — no new split,
+                    // no streamer inject (the action injected it).
+                    if let Some(local_id) =
+                        try_adopt_local_pane(&deps.state_dir, &host.name, &rp.pane_id, &local_pane_ids, log)
+                    {
+                        state.panes.insert(
+                            rp.pane_id.clone(),
+                            PaneEntry { local_id, tombstone: None, seq: 0, reported: None, cwd: None },
+                        );
                         continue;
                     }
                     // place the mirror where the REMOTE layout says the pane
@@ -1341,6 +1440,128 @@ mod tests {
             label: None,
             cwd: cwd.map(String::from),
             foreground_cwd: fg.map(String::from),
+        }
+    }
+
+    fn test_host() -> HostConfig {
+        HostConfig {
+            name: "work".into(),
+            target: "user@work".into(),
+            prefix: "w".into(),
+            remote_bin: "/opt/herdr".into(),
+            agent_bin: None,
+            always_control: true,
+        }
+    }
+
+    #[test]
+    fn streamer_argv_base_carries_transport_and_no_pane_target() {
+        let sd = Path::new("/state");
+        let base = streamer_argv_base(&test_host(), sd);
+        // mode + ssh target present, exactly one positional beyond the exe
+        assert_eq!(base[1], "pane");
+        assert_eq!(base[2], "user@work");
+        assert!(base.iter().any(|a| a == "--remote-bin"));
+        assert!(base.iter().any(|a| a == "/opt/herdr"));
+        assert!(base.iter().any(|a| a == "--always-control"));
+        assert!(base.iter().any(|a| a == "--ctl-path"));
+        assert!(base.iter().any(|a| a == "--mux-sock"));
+        assert!(base.iter().any(|a| a.contains("work.ctl")));
+        assert!(base.iter().any(|a| a.contains("work-mux.sock")));
+        // no pane-target positional and not pending
+        assert!(!base.iter().any(|a| a == "--pending"));
+
+        // pending variant is the base plus --pending, still no pane target
+        let pend = pending_streamer_argv(&test_host(), sd);
+        assert_eq!(&pend[..base.len()], &base[..]);
+        assert_eq!(pend.last().map(String::as_str), Some("--pending"));
+
+        // a non-always-control host omits the flag
+        let mut h = test_host();
+        h.always_control = false;
+        assert!(!streamer_argv_base(&h, sd).iter().any(|a| a == "--always-control"));
+    }
+
+    #[test]
+    fn adopt_maps_existing_local_pane_and_consumes_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-adopt-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = Logger::new(&dir, false);
+
+        // action wrote the adopt file pointing at a local pane that exists
+        let adopt = crate::util::adopt_path(&dir, "work", "wR:pR");
+        crate::util::write_atomic(&adopt, "w9:p1").unwrap();
+        let present: HashSet<&str> = ["w9:p1"].into_iter().collect();
+        assert_eq!(
+            try_adopt_local_pane(&dir, "work", "wR:pR", &present, &log).as_deref(),
+            Some("w9:p1")
+        );
+        // consumed regardless
+        assert!(!adopt.exists());
+
+        // adopt points at a local pane that no longer exists → None (create
+        // normally), file still consumed
+        crate::util::write_atomic(&adopt, "w9:pGONE").unwrap();
+        let empty: HashSet<&str> = HashSet::new();
+        assert_eq!(try_adopt_local_pane(&dir, "work", "wR:pR", &empty, &log), None);
+        assert!(!adopt.exists());
+
+        // no adopt file at all → None
+        assert_eq!(try_adopt_local_pane(&dir, "work", "wR:pOTHER", &present, &log), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sweep_removes_only_stale_handoff_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-sweep-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // fresh claim + adopt: kept
+        let fresh_claim = crate::util::claim_path(&dir, "w9:p1");
+        crate::util::write_atomic(&fresh_claim, &crate::util::claim_json_pane("wR:pR")).unwrap();
+        let fresh_adopt = crate::util::adopt_path(&dir, "work", "wR:pR");
+        crate::util::write_atomic(&fresh_adopt, "w9:p1").unwrap();
+
+        // stale claim + adopt: back-date their mtimes past the TTL
+        let stale_claim = crate::util::claim_path(&dir, "w9:pOLD");
+        crate::util::write_atomic(&stale_claim, &crate::util::claim_json_pane("wR:pOLD")).unwrap();
+        let stale_adopt = crate::util::adopt_path(&dir, "work", "wR:pOLD");
+        crate::util::write_atomic(&stale_adopt, "w9:pOLD").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        let ft = filetime_secs(old);
+        set_mtime(&stale_claim, ft);
+        set_mtime(&stale_adopt, ft);
+
+        sweep_stale_optimistic_files(&dir);
+
+        assert!(fresh_claim.exists(), "fresh claim kept");
+        assert!(fresh_adopt.exists(), "fresh adopt kept");
+        assert!(!stale_claim.exists(), "stale claim swept");
+        assert!(!stale_adopt.exists(), "stale adopt swept");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // back-date a file's mtime via libc::utimes so the sweep sees it as stale
+    fn filetime_secs(t: std::time::SystemTime) -> i64 {
+        t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+    }
+    fn set_mtime(path: &Path, secs: i64) {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let tv = libc::timeval { tv_sec: secs as libc::time_t, tv_usec: 0 };
+        let times = [tv, tv];
+        unsafe {
+            libc::utimes(c.as_ptr(), times.as_ptr());
         }
     }
 
